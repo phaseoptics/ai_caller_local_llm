@@ -4,7 +4,6 @@ import asyncio
 import os
 from app.twilio_stream_handler import app, call_ended, ready_chunks, write_all_chunks_to_disk
 from app.whisper_handler import whisper_transcription_loop
-from app.gpt_assistant_handler import init_conversation
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
@@ -32,21 +31,18 @@ async def run_server():
 
     print("Starting Quart app via Hypercorn on port 5000...")
     sys.stdout.flush()
-    server_task = asyncio.create_task(serve(app, config))
 
-    print("Initializing GPT Assistant thread...")
-    sys.stdout.flush()
-    thread_id = await init_conversation()
+    server_task = asyncio.create_task(serve(app, config))
 
     print("Starting Whisper transcription handler...")
     sys.stdout.flush()
-    whisper_task = asyncio.create_task(whisper_transcription_loop(thread_id))
+    whisper_task = asyncio.create_task(whisper_transcription_loop())
 
     print("Waiting for Twilio call to complete...")
     sys.stdout.flush()
     await call_ended.wait()
-    print("Call ended. Proceeding to shutdown and save audio chunks.")
 
+    print("Call ended. Proceeding to shutdown and save audio chunks.")
     server_task.cancel()
     whisper_task.cancel()
 

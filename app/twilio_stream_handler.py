@@ -13,7 +13,8 @@ from quart import Quart, request, Response, websocket
 from dotenv import load_dotenv
 from asyncio import Queue
 import uuid
-from app.gpt_assistant_handler import init_conversation
+from app.conversation_manager import handle_phrase
+from app.data_types import AudioChunk, PhraseObject
 
 # Global Variables and Events
 
@@ -30,29 +31,6 @@ logger.setLevel(logging.INFO if os.getenv("LOGGING_ENABLED", "false").lower() ==
 
 # Create Quart app
 app = Quart(__name__)
-
-# --- Data Structures ---
-@dataclass
-class AudioChunk:
-    phrase_id: str
-    chunk_index: int
-    audio_bytes: bytes
-    rms: float
-    timestamp: float  # seconds since start of stream
-    duration: float # should become len(audio_chunk.audio_bytes) / (8000 * 2)
-    transcription: str = ""
-    capture_state: str = "" # "listening or "speaking"
-
-@dataclass
-class PhraseObject:
-    phrase_id: str
-    chunks: list[AudioChunk]
-    is_done: bool = False
-    def is_complete(self) -> bool:
-        return all(chunk.transcription for chunk in self.chunks)
-    def phrase_text(self) -> str:
-        sorted_chunks = sorted(self.chunks, key=lambda c: c.chunk_index)
-        return " ".join(chunk.transcription.strip() for chunk in sorted_chunks if chunk.transcription).strip()
 
 # Mapping of phrase_id → PhraseObject
 detected_phrases: dict[str, PhraseObject] = {}
@@ -99,7 +77,6 @@ def calculate_rms(chunk: bytes) -> float:
 # --- WebSocket Route ---
 @app.websocket("/stream")
 async def media_stream():
-    thread_id = await init_conversation()
     logger.info("WebSocket connection established with Twilio.")
     # Parameters
     MIN_SPEECH_RMS_THRESHOLD = 400.0
