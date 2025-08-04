@@ -79,7 +79,7 @@ def calculate_rms(chunk: bytes) -> float:
 async def media_stream():
     logger.info("WebSocket connection established with Twilio.")
     # Parameters
-    MIN_SPEECH_RMS_THRESHOLD = 400.0
+    MIN_SPEECH_RMS_THRESHOLD = 600.0
     CHUNK_SILENCE_DURATION_SECONDS = 0.3 #0.5
     DONE_SPEAKING_SILENCE_DURATION_SECONDS = 0.6
     MINCHUNK_DURATION_SECONDS = 0.4

@@ -1,22 +1,41 @@
 import requests
 import logging
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+# Configuration
+OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "gemma3:1b"
 MAX_TOKENS = 80
 TEMPERATURE = 0.7
 
-logger = logging.getLogger("gpt_handler")
+# Logger setup
+logger = logging.getLogger("llm_local_handler")
 logger.setLevel(logging.INFO)
 
-def generate_llm_response(prompt: str) -> str:
-    logger.info(f"[GPT] Sending prompt to Gemma:\n{prompt}")
+# Initialize a new conversation with a system prompt
+def initialize_conversation() -> list:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a calm, intelligent, human-like assistant. "
+                "Avoid using emoji, slang, or decorative formatting. "
+                "Do not respond in lists unless explicitly asked. "
+                "Speak clearly and naturally like a helpful human would."
+            )
+        }
+    ]
+
+# Send a user prompt and return the assistant's reply and updated history
+def generate_llm_response(prompt: str, message_history: list) -> tuple[str, list]:
+    logger.info(f"[Gemma] User prompt:\n{prompt}")
+    message_history.append({"role": "user", "content": prompt})
+
     try:
         response = requests.post(
             OLLAMA_URL,
             json={
                 "model": MODEL_NAME,
-                "prompt": prompt,
+                "messages": message_history,
                 "stream": False,
                 "options": {
                     "num_predict": MAX_TOKENS,
@@ -26,9 +45,11 @@ def generate_llm_response(prompt: str) -> str:
             timeout=10,
         )
         response.raise_for_status()
-        reply = response.json()["response"].strip()
-        logger.info(f"[GPT] Response from Gemma:\n{reply}")
-        return reply
+        reply = response.json()["message"]["content"].strip()
+        logger.info(f"[Gemma] Assistant reply:\n{reply}")
+        message_history.append({"role": "assistant", "content": reply})
+        return reply, message_history
+
     except Exception as e:
-        logger.error(f"[GPT] Error calling local model: {e}")
-        return "[Error generating response]"
+        logger.error(f"[Gemma] Error calling local model: {e}")
+        return "[Error generating response]", message_history
