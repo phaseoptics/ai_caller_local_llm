@@ -130,8 +130,8 @@ async def media_stream():
                 rms = calculate_rms(chunk)
                 pcm = ulaw_to_pcm(chunk)
 
-                if rms > 50:
-                    logger.info(f"Frame #{chunk_index}: RMS={rms:.2f}")
+                #if rms > MIN_SPEECH_RMS_THRESHOLD:
+                #    logger.debug(f"Frame #{chunk_index}: RMS={rms:.2f}")
 
                 # Always buffer to pre-chunk ring buffer
                 pre_chunk_pcm_buffer.extend(pcm)
@@ -179,8 +179,7 @@ async def media_stream():
                                 detected_phrases[phrase_id] = PhraseObject(phrase_id=phrase_id, chunks=[])
                             detected_phrases[phrase_id].chunks.append(chunk)
 
-                            logger.info(f"Created AudioChunk #{chunk_index} with phrase_id={phrase_id} and added to queues.")
-                            
+                            logger.info(f"AudioChunk formation completed in frame #{chunk_index} with phrase_id={phrase_id} and added to queues.")
                             # Reset
                             active_pcm = bytearray()
                             silence_counter = 0

@@ -64,14 +64,14 @@ async def whisper_transcription_loop():
             chunk.transcription = transcript
             processed_chunks.add(chunk.chunk_index)
 
-            logger.info(f"Transcript for chunk {chunk.chunk_index} in phrase {chunk.phrase_id}:\n{transcript}")
+            logger.debug(f"Transcript for chunk {chunk.chunk_index} in phrase {chunk.phrase_id}:\n{transcript}")
             await stitch_ready_chunks.put(chunk)
 
             phrase = detected_phrases.get(chunk.phrase_id)
             if phrase and phrase.is_complete() and not phrase.is_done:
                 phrase.is_done = True
-                logger.info(f"Phrase {phrase.phrase_id} is complete. GPT task launched.")
-                logger.info(f"[DEBUG] Phrase text: '{phrase.phrase_text()}'")
+                logger.debug(f"Phrase {phrase.phrase_id} is complete. LLM task launched.")
+                #logger.debug(f"[DEBUG] Phrase text: '{phrase.phrase_text()}'")
                 asyncio.create_task(handle_phrase(phrase))
 
         except asyncio.CancelledError:

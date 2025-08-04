@@ -8,7 +8,7 @@ message_history = initialize_conversation()
 async def handle_phrase(phrase: PhraseObject) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] >>> Caller: {phrase.phrase_text()}", flush=True)
-    print(f"[{timestamp}] >>> Sending to local LLM...", flush=True)
+    #print(f"[{timestamp}] >>> Sending to local LLM...", flush=True)
 
     start = datetime.now()
     response, updated_history = generate_llm_response(phrase.phrase_text(), message_history)

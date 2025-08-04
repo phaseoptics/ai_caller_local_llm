@@ -17,17 +17,18 @@ def initialize_conversation() -> list:
         {
             "role": "system",
             "content": (
-                "You are a calm, intelligent, human-like assistant. "
-                "Avoid using emoji, slang, or decorative formatting. "
-                "Do not respond in lists unless explicitly asked. "
-                "Speak clearly and naturally like a helpful human would."
+                "You are a calm, intelligent, human-like assistant."
+                "Never use emoji, slang, or decorative formatting."
+                "Do not respond in lists."
+                "Speak clearly and naturally like a helpful human."
+                "Keep responses brief."
             )
         }
     ]
 
 # Send a user prompt and return the assistant's reply and updated history
 def generate_llm_response(prompt: str, message_history: list) -> tuple[str, list]:
-    logger.info(f"[Gemma] User prompt:\n{prompt}")
+    logger.debug(f"[Gemma] User prompt:\n{prompt}")
     message_history.append({"role": "user", "content": prompt})
 
     try:
@@ -46,7 +47,7 @@ def generate_llm_response(prompt: str, message_history: list) -> tuple[str, list
         )
         response.raise_for_status()
         reply = response.json()["message"]["content"].strip()
-        logger.info(f"[Gemma] Assistant reply:\n{reply}")
+        logger.debug(f"[Gemma] Assistant reply:\n{reply}")
         message_history.append({"role": "assistant", "content": reply})
         return reply, message_history
 

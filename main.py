@@ -17,6 +17,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
+# Only escalate OpenAI message if WARNING 
+logging.getLogger("openai").setLevel(logging.WARNING)
+
 # Silence Hypercorn's default logging duplication
 logging.getLogger("hypercorn.error").propagate = False
 logging.getLogger("hypercorn.access").propagate = False
