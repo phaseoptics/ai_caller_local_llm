@@ -37,6 +37,7 @@ def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
             output_format="mp3_44100_128"
         )
 
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "wb") as f:
             for chunk in audio_stream:
                 f.write(chunk)
@@ -58,16 +59,11 @@ def encode_mp3_to_ulaw_frames(mp3_path: str) -> list[str]:
     logger.info(f"Encoded {len(b64_frames)} frames.")
     return b64_frames
 
-def generate_initial_greeting_mp3(output_path: str = "app/audio_temp/greeting.mp3", overwrite: bool = False) -> bool:
+def generate_initial_greeting_mp3(output_path: str = "app/audio_static/greeting.mp3") -> bool:
     """
-    Generate the greeting "Hello! How can I be of assistance?" and save to MP3.
-    Skips generation if file exists unless overwrite=True.
+    Always generate the greeting "Hello! How can I be of assistance?" and save to MP3.
+    Overwrites the file every time to reflect changes in text or voice.
     """
     greeting_text = "Hello! How can I be of assistance?"
-
-    if os.path.exists(output_path) and not overwrite:
-        logger.info(f"📁 Greeting MP3 already exists at {output_path}. Skipping regeneration.")
-        return True
-
     logger.info(f"🎙️ Generating initial greeting MP3: {greeting_text}")
     return synthesize_speech_to_mp3(greeting_text, output_path)

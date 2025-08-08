@@ -69,7 +69,7 @@ async def run_server():
 if __name__ == "__main__":
     try:
         # Generate ElevenLabs greeting MP3 (if not already cached)
-        generate_initial_greeting_mp3("app/audio_temp/greeting.mp3")
+        generate_initial_greeting_mp3("app/audio_static/greeting.mp3")
 
         asyncio.run(run_server())
     except KeyboardInterrupt:
