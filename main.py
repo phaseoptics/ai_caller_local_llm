@@ -4,6 +4,7 @@ import asyncio
 import os
 from app.twilio_stream_handler import app, call_ended, ready_chunks, write_all_chunks_to_disk
 from app.whisper_handler import whisper_transcription_loop
+from app.elevenlabs_handler import generate_initial_greeting_mp3
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
@@ -67,6 +68,9 @@ async def run_server():
 # --- Startup Hook ---
 if __name__ == "__main__":
     try:
+        # Generate ElevenLabs greeting MP3 (if not already cached)
+        generate_initial_greeting_mp3("app/audio_temp/greeting.mp3")
+
         asyncio.run(run_server())
     except KeyboardInterrupt:
         print("Shutdown requested by user (Ctrl+C). Exiting cleanly...")

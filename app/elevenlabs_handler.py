@@ -57,3 +57,17 @@ def encode_mp3_to_ulaw_frames(mp3_path: str) -> list[str]:
     b64_frames = [base64.b64encode(frame).decode("utf-8") for frame in frames]
     logger.info(f"Encoded {len(b64_frames)} frames.")
     return b64_frames
+
+def generate_initial_greeting_mp3(output_path: str = "app/audio_temp/greeting.mp3", overwrite: bool = False) -> bool:
+    """
+    Generate the greeting "Hello! How can I be of assistance?" and save to MP3.
+    Skips generation if file exists unless overwrite=True.
+    """
+    greeting_text = "Hello! How can I be of assistance?"
+
+    if os.path.exists(output_path) and not overwrite:
+        logger.info(f"📁 Greeting MP3 already exists at {output_path}. Skipping regeneration.")
+        return True
+
+    logger.info(f"🎙️ Generating initial greeting MP3: {greeting_text}")
+    return synthesize_speech_to_mp3(greeting_text, output_path)
