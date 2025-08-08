@@ -258,3 +258,7 @@ async def media_stream():
 
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+
+    finally:
+        # make sure the main loop cam exit even if Twilio never sent stop
+        call_ended.set()
