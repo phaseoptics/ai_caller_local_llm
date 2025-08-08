@@ -116,6 +116,38 @@ async def media_stream():
             if event_type == "start":
                 logger.info("Twilio media stream started.")
 
+                # Extract streamSid
+                stream_sid = event.get("start", {}).get("streamSid", "placeholder")
+
+                # --- Send dummy silence frame immediately to prevent Twilio hangup
+                dummy_frame = base64.b64encode(b"\xff" * 160).decode()
+                await websocket.send_json({
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": dummy_frame}
+                })
+                logger.info("🟡 Sent dummy frame to hold stream open.")
+
+                # --- Stream greeting.mp3 from disk over WebSocket
+                from app.elevenlabs_handler import encode_mp3_to_ulaw_frames
+
+                try:
+                    greeting_path = "app/audio_static/greeting.mp3"
+                    frames = encode_mp3_to_ulaw_frames(greeting_path)
+                    logger.info(f"📢 Streaming greeting: {len(frames)} frames")
+
+                    for frame in frames:
+                        await websocket.send_json({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": frame}
+                        })
+                        await asyncio.sleep(0.02)  # 20ms per frame
+
+                    logger.info("✅ Greeting playback complete.")
+                except Exception as e:
+                    logger.error(f"❌ Failed to stream greeting: {e}")
+
             elif event_type == "stop":
                 logger.info("Twilio media stream stopped.")
                 call_ended.set()
