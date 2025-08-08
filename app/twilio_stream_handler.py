@@ -4,6 +4,7 @@ import asyncio
 import base64
 import audioop
 import wave
+import time
 import json
 from io import BytesIO
 from collections import deque
@@ -36,6 +37,24 @@ app = Quart(__name__)
 
 # Mapping of phrase_id → PhraseObject
 detected_phrases: dict[str, PhraseObject] = {}
+
+async def _stream_ulaw_frames(stream_sid: str, frames: list[str]):
+    """
+    Send pre-encoded μ-law frames at precise 20 ms intervals using a monotonic clock.
+    """
+    base = time.monotonic()
+    interval = 0.02
+    for i, frame in enumerate(frames, 1):
+        await websocket.send_json({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": frame}
+        })
+        # sleep until the next exact slot to avoid cumulative drift
+        target = base + i * interval
+        delay = target - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 async def write_all_chunks_to_disk(queue: asyncio.Queue, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
@@ -95,13 +114,7 @@ async def _stream_mp3_path(stream_sid: str, mp3_path: str):
     """Blocking send inside media_stream coroutine. Reads MP3, encodes to μ-law 8kHz, streams at 20ms pace."""
     frames = encode_mp3_to_ulaw_frames(mp3_path)
     logger.info(f"📢 Streaming {os.path.basename(mp3_path)}: {len(frames)} frames")
-    for frame in frames:
-        await websocket.send_json({
-            "event": "media",
-            "streamSid": stream_sid,
-            "media": {"payload": frame}
-        })
-        await asyncio.sleep(0.02)  # 20ms pacing
+    await _stream_ulaw_frames(stream_sid, frames)
     logger.info(f"✅ Finished streaming {os.path.basename(mp3_path)}")
 
 # --- WebSocket Route ---

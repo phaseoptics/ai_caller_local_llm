@@ -5,27 +5,29 @@ from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
 import base64
 import audioop
-from pydub import AudioSegment, effects  # <-- effects for normalize/compression
+from pydub import AudioSegment, effects
+import math
 
 # --- Logging ---
 logger = logging.getLogger("elevenlabs_handler")
 logger.setLevel(logging.INFO)
 
-# Quiet noisy libs
+# Suppress noisy libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("elevenlabs").setLevel(logging.WARNING)
 
-# --- Env ---
+# --- Load environment ---
 load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
-# --- Client ---
+# --- Init client ---
 client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
     """
-    ElevenLabs TTS → MP3 on disk.
+    Converts text to speech and saves it as an MP3 to `output_path`.
+    Returns True if successful, False otherwise.
     """
     try:
         audio_stream = client.text_to_speech.convert(
@@ -49,55 +51,42 @@ def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
 
 def encode_mp3_to_ulaw_frames(mp3_path: str) -> list[str]:
     """
-    MP3 → (level, compress, fade, pad) → 8 kHz mono → μ-law → base64 20 ms frames.
-    Minimal but effective cleanup to reduce crackle.
+    Convert MP3 to μ-law 8 kHz mono frames with gentle dynamics and
+    proper 20 ms alignment to reduce crackle/clicks.
     """
     logger.info(f"Encoding MP3 to μ-law base64 frames: {mp3_path}")
 
-    # Load and target telephony format
-    seg = AudioSegment.from_mp3(mp3_path).set_channels(1)
+    # Load and telephony-shape the audio
+    seg = AudioSegment.from_mp3(mp3_path)
+    seg = seg.set_channels(1)
 
-    # Gentle band-limiting helps resample quality (optional but cheap)
-    try:
-        seg = seg.low_pass_filter(3400).high_pass_filter(120)
-    except Exception:
-        # If ffmpeg filters not available, just continue
-        pass
+    # Anti-alias to 8 kHz: low-pass ~3.4 kHz, high-pass ~120 Hz (kill rumble)
+    seg = seg.low_pass_filter(3400).high_pass_filter(120)
 
-    # Resample AFTER filtering
+    # Resample *after* filtering
     seg = seg.set_frame_rate(8000).set_sample_width(2)
 
-    # --- The “easy” crackle fixes ---
-    # 1) Normalize with a little headroom so μ-law companding doesn't crunch peaks
-    seg = effects.normalize(seg, headroom=3.0)
-
-    # 2) Light dynamic range compression to smooth loud consonants
-    seg = effects.compress_dynamic_range(
-        seg,
-        threshold=-18.0,  # dBFS
-        ratio=2.0,
-        attack=5,         # ms
-        release=50        # ms
-    )
-
-    # 3) Tiny fades to soften edges
+    # Leveling and click-reduction
+    seg = effects.normalize(seg, headroom=3.0)  # leave headroom before companding
     seg = seg.fade_in(8).fade_out(8)
 
-    # 4) 20ms pad at start/end to avoid partial-frame clicks
+    # Pad 20 ms silence at start/end to avoid hard edges during start/stop
     pad = AudioSegment.silent(duration=20, frame_rate=8000)
     seg = pad + seg + pad
 
-    # Ensure exact 20ms multiple length for perfect framing
+    # Ensure total length is an exact multiple of 20 ms frames
     frame_ms = 20
-    remainder = len(seg) % frame_ms
+    total_ms = len(seg)
+    remainder = total_ms % frame_ms
     if remainder:
         seg += AudioSegment.silent(duration=(frame_ms - remainder), frame_rate=8000)
 
-    # μ-law encode to 20ms (160-byte) frames
-    pcm16 = seg.raw_data  # 16-bit, mono, 8 kHz
-    mulaw = audioop.lin2ulaw(pcm16, 2)  # 2 bytes/sample
+    # μ-law encode
+    pcm16 = seg.raw_data  # 16-bit mono @ 8 kHz
+    mulaw = audioop.lin2ulaw(pcm16, 2)
 
-    frame_size = 160  # 20ms at 8k μ-law
+    # Slice into 160-byte (20 ms) frames
+    frame_size = 160
     b64_frames = [
         base64.b64encode(mulaw[i:i+frame_size]).decode("utf-8")
         for i in range(0, len(mulaw), frame_size)
@@ -108,7 +97,8 @@ def encode_mp3_to_ulaw_frames(mp3_path: str) -> list[str]:
 
 def generate_initial_greeting_mp3(output_path: str = "app/audio_static/greeting.mp3") -> bool:
     """
-    Always (re)generate a simple greeting so changes propagate without cache weirdness.
+    Always generate the greeting "Hello! How can I be of assistance?" and save to MP3.
+    Overwrites the file every time to reflect changes in text or voice.
     """
     greeting_text = "Hello! How can I be of assistance?"
     logger.info(f"🎙️ Generating initial greeting MP3: {greeting_text}")
