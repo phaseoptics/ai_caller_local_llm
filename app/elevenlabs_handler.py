@@ -1,34 +1,42 @@
+# app/elevenlabs_handler.py
 import os
 import logging
+import threading
+import asyncio
+import base64
+import audioop
+from typing import AsyncIterator
+
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
-import base64
-import audioop
 from pydub import AudioSegment, effects  # normalize/compress
 
+# --- Logging ---
 logger = logging.getLogger("elevenlabs_handler")
 logger.setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("elevenlabs").setLevel(logging.WARNING)
 
+# --- Env ---
 load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
-
-# Low-latency model; keep configurable via .env
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
 try:
-    ELEVENLABS_SPEED = float(os.getenv("ELEVENLABS_SPEED", "0.90"))  # slower = calmer
+    ELEVENLABS_SPEED = float(os.getenv("ELEVENLABS_SPEED", "0.90"))  # calmer pacing
 except ValueError:
     ELEVENLABS_SPEED = 0.90
 
+# --- Client ---
 client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
+# ================================
+# A) File-based synthesis (fallback)
+# ================================
 def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
     """
     ElevenLabs TTS → MP3 on disk.
-    NOTE: 'speed' must be set inside voice_settings (not as a top-level arg).
     """
     try:
         audio_stream = client.text_to_speech.convert(
@@ -40,20 +48,13 @@ def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
                 stability=0.55,
                 similarity_boost=0.70,
                 speed=ELEVENLABS_SPEED,
-                # use_speaker_boost left default (True)
             ),
-            # apply_text_normalization left at service defaults; cannot be forced "on" for flash_v2_5
         )
-
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "wb") as f:
             for chunk in audio_stream:
                 f.write(chunk)
-
-        logger.info(
-            "✅ ElevenLabs MP3 written to %s (model=%s, speed=%.2f)",
-            output_path, ELEVENLABS_MODEL, ELEVENLABS_SPEED
-        )
+        logger.info(f"✅ ElevenLabs MP3 written to {output_path}")
         return True
     except Exception as e:
         logger.error(f"❌ ElevenLabs synthesis failed: {e}")
@@ -94,6 +95,61 @@ def encode_mp3_to_ulaw_frames(mp3_path: str) -> list[str]:
     ]
 
 def generate_initial_greeting_mp3(output_path: str = "app/audio_static/greeting.mp3") -> bool:
+    """
+    Generate/refresh the greeting used at call start (file-based path).
+    """
     greeting_text = "Hello. How can I help you today?"
-    logger.info(f"🎙️ Generating initial greeting MP3 (model={ELEVENLABS_MODEL}, speed={ELEVENLABS_SPEED}): {greeting_text}")
+    logger.info(
+        f"🎙️ Generating initial greeting MP3 (model={ELEVENLABS_MODEL}, speed={ELEVENLABS_SPEED}): {greeting_text}"
+    )
     return synthesize_speech_to_mp3(greeting_text, output_path)
+
+# =========================================
+# B) True streaming (μ-law 8 kHz, no files)
+# =========================================
+async def stream_tts_ulaw_frames(text: str) -> AsyncIterator[str]:
+    """
+    Yield base64 μ-law frames (160 bytes = 20ms @ 8 kHz) from ElevenLabs in real time.
+    """
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+    SENTINEL = object()
+
+    def _producer():
+        try:
+            stream = client.text_to_speech.convert(
+                voice_id=ELEVENLABS_VOICE_ID,
+                model_id=ELEVENLABS_MODEL,
+                text=text,
+                output_format="ulaw_8000",  # telephony-ready μ-law @ 8 kHz
+                voice_settings=VoiceSettings(
+                    stability=0.55,
+                    similarity_boost=0.70,
+                    speed=ELEVENLABS_SPEED,
+                ),
+            )
+            for chunk in stream:
+                if chunk:
+                    loop.call_soon_threadsafe(q.put_nowait, chunk)
+        except Exception as e:
+            logger.error(f"❌ ElevenLabs streaming failed: {e}")
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, SENTINEL)
+
+    threading.Thread(target=_producer, daemon=True).start()
+
+    # Frame to exact 160-byte packets and yield as base64
+    buf = bytearray()
+    while True:
+        item = await q.get()
+        if item is SENTINEL:
+            break
+        buf.extend(item)
+        while len(buf) >= 160:
+            frame = bytes(buf[:160]); del buf[:160]
+            yield base64.b64encode(frame).decode("utf-8")
+
+    # tail: pad to a full frame so Twilio doesn't click on shutdown
+    if buf:
+        pad = 160 - len(buf)
+        yield base64.b64encode(bytes(buf + b"\xff" * pad)).decode("utf-8")
