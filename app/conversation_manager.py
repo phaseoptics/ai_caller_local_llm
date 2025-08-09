@@ -24,7 +24,7 @@ async def handle_phrase(phrase: PhraseObject) -> str:
     message_history.extend(updated_history)
 
     # Synthesize and enqueue for playback (WebSocket sends happen only inside media_stream)
-    out_dir = "app/audio_static"
+    out_dir = "app/audio_temp"
     os.makedirs(out_dir, exist_ok=True)
     mp3_path = os.path.join(out_dir, "llm_response.mp3")
 
