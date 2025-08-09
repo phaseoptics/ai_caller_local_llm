@@ -5,35 +5,44 @@ from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
 import base64
 import audioop
-from pydub import AudioSegment, effects  # <-- effects for normalize/compression
+from pydub import AudioSegment, effects  # normalize/compress
 
-# --- Logging ---
 logger = logging.getLogger("elevenlabs_handler")
 logger.setLevel(logging.INFO)
-
-# Quiet noisy libs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("elevenlabs").setLevel(logging.WARNING)
 
-# --- Env ---
 load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
-# --- Client ---
+# Low-latency model; keep configurable via .env
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
+try:
+    ELEVENLABS_SPEED = float(os.getenv("ELEVENLABS_SPEED", "0.90"))  # slower = calmer
+except ValueError:
+    ELEVENLABS_SPEED = 0.90
+
 client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
     """
     ElevenLabs TTS → MP3 on disk.
+    NOTE: 'speed' must be set inside voice_settings (not as a top-level arg).
     """
     try:
         audio_stream = client.text_to_speech.convert(
             voice_id=ELEVENLABS_VOICE_ID,
-            model_id="eleven_multilingual_v2",
+            model_id=ELEVENLABS_MODEL,
             text=text,
-            voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75),
-            output_format="mp3_44100_128"
+            output_format="mp3_44100_128",
+            voice_settings=VoiceSettings(
+                stability=0.55,
+                similarity_boost=0.70,
+                speed=ELEVENLABS_SPEED,
+                # use_speaker_boost left default (True)
+            ),
+            # apply_text_normalization left at service defaults; cannot be forced "on" for flash_v2_5
         )
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -41,7 +50,10 @@ def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
             for chunk in audio_stream:
                 f.write(chunk)
 
-        logger.info(f"✅ ElevenLabs MP3 written to {output_path}")
+        logger.info(
+            "✅ ElevenLabs MP3 written to %s (model=%s, speed=%.2f)",
+            output_path, ELEVENLABS_MODEL, ELEVENLABS_SPEED
+        )
         return True
     except Exception as e:
         logger.error(f"❌ ElevenLabs synthesis failed: {e}")
@@ -49,67 +61,39 @@ def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
 
 def encode_mp3_to_ulaw_frames(mp3_path: str) -> list[str]:
     """
-    MP3 → (level, compress, fade, pad) → 8 kHz mono → μ-law → base64 20 ms frames.
-    Minimal but effective cleanup to reduce crackle.
+    MP3 → (filter, normalize, compress, fade, pad) → 8 kHz mono → μ-law → base64 20 ms frames.
     """
     logger.info(f"Encoding MP3 to μ-law base64 frames: {mp3_path}")
 
-    # Load and target telephony format
     seg = AudioSegment.from_mp3(mp3_path).set_channels(1)
-
-    # Gentle band-limiting helps resample quality (optional but cheap)
     try:
         seg = seg.low_pass_filter(3400).high_pass_filter(120)
     except Exception:
-        # If ffmpeg filters not available, just continue
         pass
 
-    # Resample AFTER filtering
     seg = seg.set_frame_rate(8000).set_sample_width(2)
-
-    # --- The “easy” crackle fixes ---
-    # 1) Normalize with a little headroom so μ-law companding doesn't crunch peaks
     seg = effects.normalize(seg, headroom=3.0)
-
-    # 2) Light dynamic range compression to smooth loud consonants
-    seg = effects.compress_dynamic_range(
-        seg,
-        threshold=-18.0,  # dBFS
-        ratio=2.0,
-        attack=5,         # ms
-        release=50        # ms
-    )
-
-    # 3) Tiny fades to soften edges
+    seg = effects.compress_dynamic_range(seg, threshold=-18.0, ratio=2.0, attack=5, release=50)
     seg = seg.fade_in(8).fade_out(8)
 
-    # 4) 20ms pad at start/end to avoid partial-frame clicks
     pad = AudioSegment.silent(duration=20, frame_rate=8000)
     seg = pad + seg + pad
 
-    # Ensure exact 20ms multiple length for perfect framing
     frame_ms = 20
     remainder = len(seg) % frame_ms
     if remainder:
         seg += AudioSegment.silent(duration=(frame_ms - remainder), frame_rate=8000)
 
-    # μ-law encode to 20ms (160-byte) frames
-    pcm16 = seg.raw_data  # 16-bit, mono, 8 kHz
-    mulaw = audioop.lin2ulaw(pcm16, 2)  # 2 bytes/sample
+    pcm16 = seg.raw_data
+    mulaw = audioop.lin2ulaw(pcm16, 2)
 
-    frame_size = 160  # 20ms at 8k μ-law
-    b64_frames = [
+    frame_size = 160  # 20 ms @ 8 kHz μ-law
+    return [
         base64.b64encode(mulaw[i:i+frame_size]).decode("utf-8")
         for i in range(0, len(mulaw), frame_size)
     ]
 
-    logger.info(f"Encoded {len(b64_frames)} frames.")
-    return b64_frames
-
 def generate_initial_greeting_mp3(output_path: str = "app/audio_static/greeting.mp3") -> bool:
-    """
-    Always (re)generate a simple greeting so changes propagate without cache weirdness.
-    """
-    greeting_text = "Hello! How can I be of assistance?"
-    logger.info(f"🎙️ Generating initial greeting MP3: {greeting_text}")
+    greeting_text = "Hello. How can I help you today?"
+    logger.info(f"🎙️ Generating initial greeting MP3 (model={ELEVENLABS_MODEL}, speed={ELEVENLABS_SPEED}): {greeting_text}")
     return synthesize_speech_to_mp3(greeting_text, output_path)
