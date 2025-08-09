@@ -9,8 +9,18 @@ from app.queues import llm_playback_queue, tts_requests_queue
 
 # Persistent message history for the current call session
 message_history = initialize_conversation()
-
 ELEVEN_STREAMING = os.getenv("ELEVEN_STREAMING", "false").lower() == "true"
+
+MAX_TURNS = 2  # keep only the last 2 (user,assistant) pairs
+
+def _trim_history(hist: list, max_turns: int = MAX_TURNS) -> None:
+    if not hist:
+        return
+    # keep system message + last N*2 role messages
+    system = hist[0:1]
+    tail = hist[-(max_turns * 2):] if len(hist) > 1 else []
+    hist.clear()
+    hist.extend(system + tail)
 
 async def handle_phrase(phrase: PhraseObject) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -23,15 +33,14 @@ async def handle_phrase(phrase: PhraseObject) -> str:
     print(f"⏱ LLM response time: {duration:.2f} seconds", flush=True)
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] <<< LLM: {response}", flush=True)
 
-    # Update the shared message history
+    # Update the shared message history with trimming
     message_history.clear()
     message_history.extend(updated_history)
+    _trim_history(message_history, MAX_TURNS)
 
     if ELEVEN_STREAMING:
-        # NEW: stream-through path (no file IO). The Twilio handler drains this queue.
         await tts_requests_queue.put(response)
     else:
-        # Fallback: synthesize to MP3 and enqueue file path for playback
         out_dir = "app/audio_temp"
         os.makedirs(out_dir, exist_ok=True)
         mp3_path = os.path.join(out_dir, f"llm_response__{uuid4().hex}.mp3")

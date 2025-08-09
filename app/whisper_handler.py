@@ -1,3 +1,4 @@
+# app/whisper_handler.py
 import os
 import logging
 import asyncio
@@ -8,7 +9,7 @@ from typing import Tuple, Dict, Optional
 
 import numpy as np
 from openai import AsyncOpenAI
-from app.twilio_stream_handler import ready_chunks, transcription_queue, detected_phrases
+from app.twilio_stream_handler import transcription_queue, detected_phrases
 from app.data_types import AudioChunk, PhraseObject
 from app.conversation_manager import handle_phrase
 
@@ -117,7 +118,7 @@ if USE_LOCAL_WHISPER:
 
 def _transcribe_local_sync(float16k: np.ndarray) -> str:
     model = _lazy_load_faster_model()
-    segments, info = model.transcribe(
+    segments, _info = model.transcribe(
         float16k,
         beam_size=LOCAL_BEAM_SIZE,
         vad_filter=False,
@@ -156,14 +157,19 @@ async def transcribe_audio(audio_bytes: bytes) -> Tuple[str, Dict]:
         return await _transcribe_api(audio_bytes)
 
 async def whisper_transcription_loop():
+    """
+    Consumes AudioChunks from transcription_queue, writes transcripts onto the same
+    chunk objects, and when a phrase is complete, snapshots the phrase and hands
+    it to the LLM handler (so subsequent pruning doesn't erase the prompt).
+    """
     logger.info("Whisper transcription loop started.")
-    processed_chunks = set()
 
     while True:
         try:
             chunk: AudioChunk = await transcription_queue.get()
 
-            if chunk.transcription != "" or chunk.chunk_index in processed_chunks:
+            # Skip if we've already transcribed this chunk
+            if chunk.is_transcribed:
                 continue
 
             # ---- Transcribe this chunk ----
@@ -171,13 +177,12 @@ async def whisper_transcription_loop():
 
             # Update the shared chunk object
             chunk.transcription = transcript or ""   # empty is allowed
-            chunk.is_transcribed = True              # NEW: mark processed regardless of content
-            processed_chunks.add(chunk.chunk_index)
+            chunk.is_transcribed = True
 
             # Timing/latency diagnostics
             if timings.get("path") == "local":
                 logger.info(
-                    "WHISPER(local) | phrase=%s chunk=%d dur=%.3fs bytes=%d | upsample=%.1fms whisper=%.1fms total=%.1fms | text='%s'",
+                    "WHISPER(local) | phrase=%s chunk=%d dur=%.3fs bytes=%d | up=%.1fms whisper=%.1fms total=%.1fms | text='%s'",
                     chunk.phrase_id, chunk.chunk_index, float(chunk.duration), len(chunk.audio_bytes),
                     timings.get("upsample_ms", 0.0), timings.get("whisper_ms", 0.0), timings.get("total_ms", 0.0),
                     (transcript[:80] + "…") if len(transcript) > 80 else transcript
@@ -192,11 +197,28 @@ async def whisper_transcription_loop():
 
             await stitch_ready_chunks.put(chunk)
 
-            # If the whole phrase has transcripts, kick off the LLM path once
+            # ----- If the whole phrase has transcripts, kick off the LLM path once -----
             phrase: PhraseObject | None = detected_phrases.get(chunk.phrase_id)
             if phrase and phrase.is_complete() and not phrase.is_done:
+                # Mark live phrase as done to prevent duplicate triggers
                 phrase.is_done = True
-                asyncio.create_task(handle_phrase(phrase))
+
+                # Snapshot BEFORE any cleanup so handle_phrase always sees text
+                snapshot = PhraseObject(
+                    phrase_id=phrase.phrase_id,
+                    chunks=list(phrase.chunks),  # shallow copy: chunk objects hold the transcripts
+                    is_done=True
+                )
+
+                # Hand off to LLM on a task
+                asyncio.create_task(handle_phrase(snapshot))
+
+                # Now free memory on the live store (safe because we passed a snapshot)
+                try:
+                    phrase.chunks.clear()
+                except Exception:
+                    pass
+                detected_phrases.pop(chunk.phrase_id, None)
 
         except asyncio.CancelledError:
             logger.info("Whisper transcription loop cancelled.")

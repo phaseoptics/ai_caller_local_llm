@@ -3,7 +3,6 @@ import logging
 import asyncio
 import base64
 import audioop
-import wave
 import time
 import json
 from collections import deque
@@ -12,7 +11,6 @@ from dotenv import load_dotenv
 from asyncio import Queue
 import uuid
 
-from app.conversation_manager import handle_phrase
 from app.data_types import AudioChunk, PhraseObject
 from app.queues import llm_playback_queue, tts_requests_queue
 from app.elevenlabs_handler import encode_mp3_to_ulaw_frames, stream_tts_ulaw_frames
@@ -25,6 +23,7 @@ transcription_queue: Queue = Queue()   # Queue of AudioChunks for Whisper
 # Load environment variables
 load_dotenv()
 ELEVEN_STREAMING = os.getenv("ELEVEN_STREAMING", "false").lower() == "true"
+STORE_ALL_RESPONSE_AUDIO = os.getenv("STORE_ALL_RESPONSE_AUDIO", "false").lower() == "true"
 
 # Configure logging
 logger = logging.getLogger("twilio_handler")
@@ -33,13 +32,10 @@ logger.setLevel(logging.INFO if os.getenv("LOGGING_ENABLED", "false").lower() ==
 # Create Quart app
 app = Quart(__name__)
 
-# Mapping of phrase_id → PhraseObject
+# Mapping of phrase_id → PhraseObject (shared with whisper_handler)
 detected_phrases: dict[str, PhraseObject] = {}
 
 async def _stream_ulaw_frames(stream_sid: str, frames: list[str]):
-    """
-    Send pre-encoded μ-law frames at precise 20 ms intervals using a monotonic clock.
-    """
     base = time.monotonic()
     interval = 0.02
     for i, frame in enumerate(frames, 1):
@@ -50,9 +46,6 @@ async def _stream_ulaw_frames(stream_sid: str, frames: list[str]):
             await asyncio.sleep(delay)
 
 async def _stream_ulaw_frame_iter(stream_sid: str, aiter):
-    """
-    Send μ-law frames from an async iterator, pacing at 20 ms/frame with low drift.
-    """
     base = time.monotonic()
     interval = 0.02
     i = 0
@@ -97,45 +90,38 @@ def ulaw_to_pcm(ulaw_bytes: bytes) -> bytes:
 def calculate_rms(chunk: bytes) -> float:
     try:
         return audioop.rms(audioop.ulaw2lin(chunk, 2), 2)
-    except Exception as e:
-        logger.error(f"RMS calculation error: {e}")
+    except Exception:
         return 0.0
 
 async def _send_dummy_frame(stream_sid: str):
     dummy_frame = base64.b64encode(b"\xff" * 160).decode()
     await websocket.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": dummy_frame}})
-    logger.info("🟡 Sent dummy frame to hold stream open.")
 
 async def _send_clear(stream_sid: str):
     try:
         await websocket.send_json({"event": "clear", "streamSid": stream_sid})
-        logger.info("🧹 Sent clear to flush caller buffered audio.")
     except Exception as e:
         logger.error(f"Failed sending clear: {e}")
 
 async def _stream_mp3_path(stream_sid: str, mp3_path: str):
-    """Reads MP3, encodes to μ-law 8kHz, streams at 20ms pace (fallback path)."""
     frames = encode_mp3_to_ulaw_frames(mp3_path)
-    logger.info(f"📢 Streaming {os.path.basename(mp3_path)}: {len(frames)} frames")
     await _stream_ulaw_frames(stream_sid, frames)
-    logger.info(f"✅ Finished streaming {os.path.basename(mp3_path)}")
 
 @app.websocket("/stream")
 async def media_stream():
     logger.info("WebSocket connection established with Twilio.")
     # VAD / chunking parameters
-    MIN_SPEECH_RMS_THRESHOLD = 600.0
+    MIN_SPEECH_RMS_THRESHOLD = 750.0
     CHUNK_SILENCE_DURATION_SECONDS = 0.3
-    DONE_SPEAKING_SILENCE_DURATION_SECONDS = 0.6
-    MINCHUNK_DURATION_SECONDS = 0.4
+    DONE_SPEAKING_SILENCE_DURATION_SECONDS = 0.5
+    MINCHUNK_DURATION_SECONDS = 0.5
     MAXCHUNK_DURATION_SECONDS = 10.0
     LEAD_IN_DURATION_SECONDS = 0.2
 
     FRAME_DURATION_SECONDS = 0.02
     silence_chunk_limit = int(CHUNK_SILENCE_DURATION_SECONDS / FRAME_DURATION_SECONDS)
     done_speaking_chunk_limit = int(DONE_SPEAKING_SILENCE_DURATION_SECONDS / FRAME_DURATION_SECONDS)
-    min_chunk_chunks = int(MINCHUNK_DURATION_SECONDS / FRAME_DURATION_SECONDS)
-    max_chunk_chunks = int(MAXCHUNK_DURATION_SECONDS / FRAME_DURATION_SECONDS)
+    min_chunk_len_bytes = int(MINCHUNK_DURATION_SECONDS * 8000 * 2)
     lead_in_bytes = int(8000 * 2 * LEAD_IN_DURATION_SECONDS)
 
     phrase_id = str(uuid.uuid4())
@@ -148,35 +134,34 @@ async def media_stream():
     has_spoken = False
     stream_sid = None
 
+    # NEW: gate VAD during assistant playback
+    listening = True
+
     try:
         while True:
             msg = await websocket.receive()
             if msg is None:
-                logger.warning("WebSocket closed by Twilio.")
                 break
 
             event = json.loads(msg)
             event_type = event.get("event")
 
             if event_type == "start":
-                logger.info("Twilio media stream started.")
                 stream_sid = event.get("start", {}).get("streamSid", "placeholder")
-
                 await _send_dummy_frame(stream_sid)
 
-                # Optional greeting playback (fallback method)
+                # Optional greeting playback (file path)
                 try:
                     greeting_path = "app/audio_static/greeting.mp3"
                     if os.path.exists(greeting_path):
+                        listening = False
                         await _stream_mp3_path(stream_sid, greeting_path)
                         await _send_clear(stream_sid)
-                    else:
-                        logger.warning("No greeting.mp3 found, skipping greeting playback.")
+                        listening = True
                 except Exception as e:
                     logger.error(f"Failed to stream greeting: {e}")
 
             elif event_type == "stop":
-                logger.info("Twilio media stream stopped.")
                 call_ended.set()
                 break
 
@@ -184,95 +169,103 @@ async def media_stream():
                 # 1) Handle inbound caller audio (VAD / chunking)
                 payload = event["media"].get("payload")
                 if payload:
-                    chunk = base64.b64decode(payload)
-                    rms = calculate_rms(chunk)
-                    pcm = ulaw_to_pcm(chunk)
+                    ulaw = base64.b64decode(payload)
 
-                    pre_chunk_pcm_buffer.extend(pcm)
+                    if listening:
+                        rms = calculate_rms(ulaw)
+                        pcm = ulaw_to_pcm(ulaw)
+                        pre_chunk_pcm_buffer.extend(pcm)
 
-                    if not in_chunk and rms >= MIN_SPEECH_RMS_THRESHOLD:
-                        if has_spoken and phrase_silence_counter >= done_speaking_chunk_limit:
-                            logger.info("Long silence detected. Generating new phrase ID.")
-                            phrase_id = str(uuid.uuid4())
-                        has_spoken = True
-                        in_chunk = True
-                        silence_counter = 0
-                        phrase_silence_counter = 0
-                        active_pcm.extend(pre_chunk_pcm_buffer)
-                        pre_chunk_pcm_buffer.clear()
-                        logger.info(f"AudioChunk formation initiated in frame #{chunk_index} for phrase_id={phrase_id}")
-
-                    if in_chunk:
-                        active_pcm.extend(pcm)
-
-                        if rms < MIN_SPEECH_RMS_THRESHOLD:
-                            silence_counter += 1
-                            phrase_silence_counter += 1
-                        else:
+                        if not in_chunk and rms >= MIN_SPEECH_RMS_THRESHOLD:
+                            if has_spoken and phrase_silence_counter >= done_speaking_chunk_limit:
+                                phrase_id = str(uuid.uuid4())
+                            has_spoken = True
+                            in_chunk = True
                             silence_counter = 0
                             phrase_silence_counter = 0
+                            active_pcm.extend(pre_chunk_pcm_buffer)
+                            pre_chunk_pcm_buffer.clear()
 
-                        if silence_counter >= silence_chunk_limit:
-                            if len(active_pcm) >= int(MINCHUNK_DURATION_SECONDS * 8000 * 2):
-                                chunk_obj = AudioChunk(
-                                    phrase_id=phrase_id,
-                                    chunk_index=chunk_index,
-                                    audio_bytes=bytes(active_pcm),
-                                    rms=rms,
-                                    timestamp=chunk_index * FRAME_DURATION_SECONDS,
-                                    duration=len(active_pcm) / (8000 * 2),
-                                    transcription="",
-                                    capture_state="listening"
-                                )
-                                await ready_chunks.put(chunk_obj)
-                                await transcription_queue.put(chunk_obj)
+                        if in_chunk:
+                            active_pcm.extend(pcm)
 
-                                if phrase_id not in detected_phrases:
-                                    detected_phrases[phrase_id] = PhraseObject(phrase_id=phrase_id, chunks=[])
-                                detected_phrases[phrase_id].chunks.append(chunk_obj)
-
-                                logger.info(f"AudioChunk completed at frame #{chunk_index} for phrase_id={phrase_id}")
-                                active_pcm = bytearray()
+                            if rms < MIN_SPEECH_RMS_THRESHOLD:
+                                silence_counter += 1
+                                phrase_silence_counter += 1
+                            else:
                                 silence_counter = 0
-                                in_chunk = False
+                                phrase_silence_counter = 0
 
-                    elif rms < MIN_SPEECH_RMS_THRESHOLD:
-                        phrase_silence_counter += 1
-                        if phrase_silence_counter == done_speaking_chunk_limit:
-                            if has_spoken:
-                                logger.info("Detected end of phrase based on long silence.")
-                                has_spoken = False
-                                phrase_id = str(uuid.uuid4())
+                            if silence_counter >= silence_chunk_limit:
+                                if len(active_pcm) >= min_chunk_len_bytes:
+                                    chunk_obj = AudioChunk(
+                                        phrase_id=phrase_id,
+                                        chunk_index=chunk_index,
+                                        audio_bytes=bytes(active_pcm),
+                                        rms=rms,
+                                        timestamp=chunk_index * FRAME_DURATION_SECONDS,
+                                        duration=len(active_pcm) / (8000 * 2),
+                                        transcription="",
+                                        capture_state="listening"
+                                    )
 
+                                    # Only store raw audio if explicitly enabled
+                                    if STORE_ALL_RESPONSE_AUDIO:
+                                        await ready_chunks.put(chunk_obj)
+
+                                    await transcription_queue.put(chunk_obj)
+
+                                    if phrase_id not in detected_phrases:
+                                        detected_phrases[phrase_id] = PhraseObject(phrase_id=phrase_id, chunks=[])
+                                    detected_phrases[phrase_id].chunks.append(chunk_obj)
+
+                                    active_pcm = bytearray()
+                                    silence_counter = 0
+                                    in_chunk = False
+
+                        elif rms < MIN_SPEECH_RMS_THRESHOLD:
+                            phrase_silence_counter += 1
+                            if phrase_silence_counter == done_speaking_chunk_limit:
+                                if has_spoken:
+                                    has_spoken = False
+                                    phrase_id = str(uuid.uuid4())
+
+                    # advance frame index regardless (keeps timestamps monotonic)
                     chunk_index += 1
 
-                # 2) Drain any queued assistant audio immediately after each inbound frame
+                # 2) After each inbound frame, drain any assistant audio
                 if stream_sid:
-                    # Streaming path (B): send text requests as real-time μ-law frames
+                    # Streaming path (B)
                     while ELEVEN_STREAMING and not tts_requests_queue.empty():
                         text = await tts_requests_queue.get()
-                        logger.info("🔊 Streaming TTS (live) for %d chars", len(text))
+                        listening = False
                         await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
                         await _send_clear(stream_sid)
+                        listening = True
 
-                    # Fallback/file path: still supported
-                    while not llm_playback_queue.empty():
+                    # Fallback/file path
+                    while not ELEVEN_STREAMING and not llm_playback_queue.empty():
                         mp3_path = await llm_playback_queue.get()
+                        listening = False
                         await _stream_mp3_path(stream_sid, mp3_path)
                         await _send_clear(stream_sid)
+                        listening = True
 
-            # Also opportunistically drain outside of media events
+            # Opportunistic drains outside media events
             if stream_sid:
                 while ELEVEN_STREAMING and not tts_requests_queue.empty():
                     text = await tts_requests_queue.get()
-                    logger.info("🔊 Streaming TTS (live) for %d chars", len(text))
+                    listening = False
                     await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
                     await _send_clear(stream_sid)
+                    listening = True
 
-                while not llm_playback_queue.empty():
+                while not ELEVEN_STREAMING and not llm_playback_queue.empty():
                     mp3_path = await llm_playback_queue.get()
+                    listening = False
                     await _stream_mp3_path(stream_sid, mp3_path)
                     await _send_clear(stream_sid)
+                    listening = True
 
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
