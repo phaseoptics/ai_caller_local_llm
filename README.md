@@ -1,6 +1,3 @@
-Here’s the full README.md in one block so you can copy and paste directly into a file named README.md in the root of your repo.
-
-
 ---
 
 # AI Caller Local LLM
