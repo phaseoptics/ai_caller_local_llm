@@ -6,7 +6,7 @@ import logging
 # Configuration
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "gemma3:1b"
-MAX_TOKENS = 120          # hard cap to discourage rambling
+MAX_TOKENS = 150          # hard cap to discourage rambling
 TEMPERATURE = 0.2         # steadier, less listy tone
 TOP_P = 0.9
 REPEAT_PENALTY = 1.05
@@ -15,14 +15,14 @@ logger = logging.getLogger("llm_local_handler")
 logger.setLevel(logging.INFO)
 
 SYSTEM_INSTRUCTIONS = (
-    "You are a friendly and speak in a natural, conversational tone. "
+    "You are friendly and speak in a natural, conversational tone. "
     "Replies must be three sentences or fewer. "
     "Do not use 'e.g.', lists, bullets, numbering, emoji, slang, or symbols like '*' or '-'. "
     "Write one short paragraph only."
 )
 
 PER_TURN_GUARDRAIL = (
-    "RULES: Answer like natural speech. Maximum three sentences. "
+    "RULES: Answer using natural speech. Maximum three sentences. "
     "No lists, bullets, numbering, or 'e.g.'. No symbols like '*' or '-'. "
     "One short paragraph only."
 )

@@ -2,8 +2,9 @@ import logging
 import sys
 import asyncio
 import os
+import time
 
-from app.twilio_stream_handler import app, call_ended, ready_chunks, write_all_chunks_to_disk
+from app.twilio_stream_handler import app, call_ended, ready_chunks, write_all_chunks_to_disk, get_last_speech_time
 from app.whisper_handler import whisper_transcription_loop
 from app.elevenlabs_handler import generate_initial_greeting_mp3
 from hypercorn.asyncio import serve
@@ -30,11 +31,17 @@ logger = logging.getLogger("main")
 async def run_server():
     """
     Starts Hypercorn for the Quart app and the Whisper background task.
-    Waits for the call_ended event, but uses a timeout as a safety net.
+    Waits for call end OR for the caller to be silent for MAX_SILENCE_SECONDS.
     On exit, cancels tasks and, if enabled, writes buffered audio chunks to disk.
     """
-    # New flag: only persist raw caller chunks if explicitly enabled
+    # Only persist raw caller chunks if explicitly enabled
     STORE_ALL_RESPONSE_AUDIO = os.getenv("STORE_ALL_RESPONSE_AUDIO", "false").lower() == "true"
+
+    # Max allowed caller silence (seconds)
+    try:
+        MAX_SILENCE_SECONDS = float(os.getenv("MAX_SILENCE_SECONDS", "30"))
+    except ValueError:
+        MAX_SILENCE_SECONDS = 60.0
 
     # Prepare Hypercorn
     config = Config()
@@ -50,15 +57,26 @@ async def run_server():
     sys.stdout.flush()
     whisper_task = asyncio.create_task(whisper_transcription_loop())
 
-    print("Waiting for Twilio call to complete...")
+    print("Waiting for Twilio call to complete or silence timeout...")
     sys.stdout.flush()
-    TIMEOUT_SECONDS = 120
 
+    # Watchdog loop: exit if call ends OR caller has been silent for MAX_SILENCE_SECONDS
     try:
-        await asyncio.wait_for(call_ended.wait(), timeout=TIMEOUT_SECONDS)
-        print("Call end signal received.")
-    except asyncio.TimeoutError:
-        print(f"No call end signal within {TIMEOUT_SECONDS} seconds. Forcing shutdown...")
+        poll_interval = 0.5  # seconds
+        while True:
+            if call_ended.is_set():
+                print("Call end signal received.")
+                break
+
+            silent_for = time.monotonic() - get_last_speech_time()
+            if silent_for >= MAX_SILENCE_SECONDS:
+                print(f"No caller speech detected for {silent_for:.1f} seconds (>= {MAX_SILENCE_SECONDS} sec). Forcing shutdown...")
+                call_ended.set()
+                break
+
+            await asyncio.sleep(poll_interval)
+    except asyncio.CancelledError:
+        pass
 
     # Begin shutdown sequence
     print("Shutting down tasks...")

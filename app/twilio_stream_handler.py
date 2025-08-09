@@ -1,4 +1,3 @@
-# app/twilio_stream_handler.py
 import os
 import logging
 import asyncio
@@ -22,6 +21,18 @@ from app.elevenlabs_handler import encode_mp3_to_ulaw_frames, stream_tts_ulaw_fr
 call_ended = asyncio.Event()
 ready_chunks: Queue = Queue()          # Queue of AudioChunks to persist at shutdown
 transcription_queue: Queue = Queue()   # Queue of AudioChunks for Whisper
+
+# ---- Caller silence tracking ----
+# We update this whenever we detect caller speech (RMS >= threshold) and at stream start.
+_last_speech_time: float = time.monotonic()
+
+def get_last_speech_time() -> float:
+    """Return the last time (monotonic) we detected caller speech or stream start."""
+    return _last_speech_time
+
+def _mark_speech_now():
+    global _last_speech_time
+    _last_speech_time = time.monotonic()
 
 # Load environment variables
 load_dotenv()
@@ -53,7 +64,6 @@ async def _stream_ulaw_frames(stream_sid: str, frames: list[str]):
 async def _stream_ulaw_frame_iter(stream_sid: str, aiter):
     """
     Send μ-law frames from an async iterator, pacing at 20 ms/frame with low drift.
-    Adds a short post-roll of silence to avoid tail clipping at the end.
     """
     base = time.monotonic()
     interval = 0.02
@@ -61,17 +71,6 @@ async def _stream_ulaw_frame_iter(stream_sid: str, aiter):
     async for frame in aiter:
         i += 1
         await websocket.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": frame}})
-        target = base + i * interval
-        delay = target - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
-
-    # --- post-roll: ~120 ms of silence to avoid clipping ---
-    silent_frame = base64.b64encode(b"\xff" * 160).decode()
-    EXTRA_SILENT_FRAMES = 6  # 6 * 20ms = 120ms
-    for _ in range(EXTRA_SILENT_FRAMES):
-        i += 1
-        await websocket.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": silent_frame}})
         target = base + i * interval
         delay = target - time.monotonic()
         if delay > 0:
@@ -175,6 +174,9 @@ async def media_stream():
                 logger.info("Twilio media stream started.")
                 stream_sid = event.get("start", {}).get("streamSid", "placeholder")
 
+                # Initialize caller-silence timer at connection start
+                _mark_speech_now()
+
                 await _send_dummy_frame(stream_sid)
 
                 # Optional greeting playback (fallback method)
@@ -182,8 +184,6 @@ async def media_stream():
                     greeting_path = "app/audio_static/greeting.mp3"
                     if os.path.exists(greeting_path):
                         await _stream_mp3_path(stream_sid, greeting_path)
-                        # small grace before clearing the caller buffer
-                        await asyncio.sleep(0.06)
                         await _send_clear(stream_sid)
                     else:
                         logger.warning("No greeting.mp3 found, skipping greeting playback.")
@@ -202,6 +202,10 @@ async def media_stream():
                     chunk = base64.b64decode(payload)
                     rms = calculate_rms(chunk)
                     pcm = ulaw_to_pcm(chunk)
+
+                    # Update "last speech" whenever the caller is above the threshold.
+                    if rms >= MIN_SPEECH_RMS_THRESHOLD:
+                        _mark_speech_now()
 
                     pre_chunk_pcm_buffer.extend(pcm)
 
@@ -268,15 +272,12 @@ async def media_stream():
                         text = await tts_requests_queue.get()
                         logger.info("🔊 Streaming TTS (live) for %d chars", len(text))
                         await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
-                        # small settle delay to ensure last frames hit wire before clear
-                        await asyncio.sleep(0.06)
                         await _send_clear(stream_sid)
 
                     # Fallback/file path: still supported
                     while not llm_playback_queue.empty():
                         mp3_path = await llm_playback_queue.get()
                         await _stream_mp3_path(stream_sid, mp3_path)
-                        await asyncio.sleep(0.06)
                         await _send_clear(stream_sid)
 
             # Also opportunistically drain outside of media events
@@ -285,13 +286,11 @@ async def media_stream():
                     text = await tts_requests_queue.get()
                     logger.info("🔊 Streaming TTS (live) for %d chars", len(text))
                     await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
-                    await asyncio.sleep(0.06)
                     await _send_clear(stream_sid)
 
                 while not llm_playback_queue.empty():
                     mp3_path = await llm_playback_queue.get()
                     await _stream_mp3_path(stream_sid, mp3_path)
-                    await asyncio.sleep(0.06)
                     await _send_clear(stream_sid)
 
     except Exception as e:
