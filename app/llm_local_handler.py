@@ -18,8 +18,9 @@ def initialize_conversation() -> list:
             "role": "system",
             "content": (
                 "You are a calm, intelligent, human-like assistant."
+                "Respond in less than 4 sentences. "
                 "Never use emoji, slang, or decorative formatting."
-                "Do not respond in lists."
+                "Do not respond with lists."
                 "Speak clearly and naturally like a helpful human."
                 "Keep responses brief."
             )

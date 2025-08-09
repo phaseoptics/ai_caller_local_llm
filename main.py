@@ -12,7 +12,6 @@ from hypercorn.config import Config
 # -----------------------------------------------------------------------------
 # Logging setup
 # -----------------------------------------------------------------------------
-# Remove any preexisting handlers so we control formatting
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
@@ -22,22 +21,21 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# Keep OpenAI logs quieter unless warning
 logging.getLogger("openai").setLevel(logging.WARNING)
-
-# Avoid duplicate Hypercorn logs
 logging.getLogger("hypercorn.error").propagate = False
 logging.getLogger("hypercorn.access").propagate = False
 
 logger = logging.getLogger("main")
 
-
 async def run_server():
     """
     Starts Hypercorn for the Quart app and the Whisper background task.
     Waits for the call_ended event, but uses a timeout as a safety net.
-    On exit, cancels tasks and writes any buffered audio chunks to disk.
+    On exit, cancels tasks and, if enabled, writes buffered audio chunks to disk.
     """
+    # New flag: only persist raw caller chunks if explicitly enabled
+    STORE_ALL_RESPONSE_AUDIO = os.getenv("STORE_ALL_RESPONSE_AUDIO", "false").lower() == "true"
+
     # Prepare Hypercorn
     config = Config()
     config.bind = ["0.0.0.0:5000"]
@@ -52,8 +50,6 @@ async def run_server():
     sys.stdout.flush()
     whisper_task = asyncio.create_task(whisper_transcription_loop())
 
-    # Wait for call end with a timeout so we never hang forever
-    # If Twilio fails to send stop, twilio_stream_handler sets call_ended in finally
     print("Waiting for Twilio call to complete...")
     sys.stdout.flush()
     TIMEOUT_SECONDS = 120
@@ -69,30 +65,35 @@ async def run_server():
     server_task.cancel()
     whisper_task.cancel()
 
-    # Await server task
     try:
         await server_task
     except asyncio.CancelledError:
         print("Server shut down cleanly.")
 
-    # Await whisper task
     try:
         await whisper_task
     except asyncio.CancelledError:
         print("Whisper handler shut down cleanly.")
 
-    # Persist any buffered chunks
-    BUFFER_DIR = "app/audio_temp"
-    print(f"Writing {ready_chunks.qsize()} ready AudioChunks to disk in {BUFFER_DIR}...")
-    await write_all_chunks_to_disk(ready_chunks, BUFFER_DIR)
-    print("All chunks written. Exiting.")
+    # Conditionally persist buffered chunks
+    if STORE_ALL_RESPONSE_AUDIO:
+        BUFFER_DIR = "app/audio_temp"
+        print(f"Writing {ready_chunks.qsize()} ready AudioChunks to disk in {BUFFER_DIR}...")
+        await write_all_chunks_to_disk(ready_chunks, BUFFER_DIR)
+        print("All chunks written.")
+    else:
+        # Drain queue without saving (free memory)
+        drained = 0
+        while not ready_chunks.empty():
+            _ = await ready_chunks.get()
+            drained += 1
+        print(f"Skipped writing caller chunks (STORE_ALL_RESPONSE_AUDIO=false). Drained {drained} buffered chunks.")
 
+    print("Exiting.")
 
 if __name__ == "__main__":
     try:
-        # Ensure greeting exists each run so voice and text changes are reflected
         generate_initial_greeting_mp3("app/audio_static/greeting.mp3")
-
         asyncio.run(run_server())
     except KeyboardInterrupt:
         print("Shutdown requested by user. Exiting cleanly...")

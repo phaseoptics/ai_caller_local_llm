@@ -6,27 +6,25 @@ import audioop
 import wave
 import time
 import json
-from io import BytesIO
 from collections import deque
-from dataclasses import dataclass
-from datetime import datetime
-from quart import Quart, request, Response, websocket
+from quart import Quart, Response, websocket
 from dotenv import load_dotenv
 from asyncio import Queue
 import uuid
 
 from app.conversation_manager import handle_phrase
 from app.data_types import AudioChunk, PhraseObject
-from app.queues import llm_playback_queue
-from app.elevenlabs_handler import encode_mp3_to_ulaw_frames
+from app.queues import llm_playback_queue, tts_requests_queue
+from app.elevenlabs_handler import encode_mp3_to_ulaw_frames, stream_tts_ulaw_frames
 
 # Global Variables and Events
 call_ended = asyncio.Event()
-ready_chunks: Queue = Queue()   # Queue of AudioChunks to persist at shutdown
-transcription_queue: Queue = Queue()  # Queue of AudioChunks for Whisper
+ready_chunks: Queue = Queue()          # Queue of AudioChunks to persist at shutdown
+transcription_queue: Queue = Queue()   # Queue of AudioChunks for Whisper
 
 # Load environment variables
 load_dotenv()
+ELEVEN_STREAMING = os.getenv("ELEVEN_STREAMING", "false").lower() == "true"
 
 # Configure logging
 logger = logging.getLogger("twilio_handler")
@@ -45,18 +43,29 @@ async def _stream_ulaw_frames(stream_sid: str, frames: list[str]):
     base = time.monotonic()
     interval = 0.02
     for i, frame in enumerate(frames, 1):
-        await websocket.send_json({
-            "event": "media",
-            "streamSid": stream_sid,
-            "media": {"payload": frame}
-        })
-        # sleep until the next exact slot to avoid cumulative drift
+        await websocket.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": frame}})
+        target = base + i * interval
+        delay = target - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+async def _stream_ulaw_frame_iter(stream_sid: str, aiter):
+    """
+    Send μ-law frames from an async iterator, pacing at 20 ms/frame with low drift.
+    """
+    base = time.monotonic()
+    interval = 0.02
+    i = 0
+    async for frame in aiter:
+        i += 1
+        await websocket.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": frame}})
         target = base + i * interval
         delay = target - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
 
 async def write_all_chunks_to_disk(queue: asyncio.Queue, output_dir: str):
+    import wave, os
     os.makedirs(output_dir, exist_ok=True)
     idx = 0
     while not queue.empty():
@@ -71,7 +80,6 @@ async def write_all_chunks_to_disk(queue: asyncio.Queue, output_dir: str):
         idx += 1
     logger.info(f"Finished writing {idx} chunks to disk.")
 
-# --- Webhook Route ---
 @app.route("/voice", methods=["POST"])
 async def voice_webhook():
     logger.info("Received /voice webhook from Twilio.")
@@ -83,7 +91,6 @@ async def voice_webhook():
 </Response>"""
     return Response(twiml, mimetype="text/xml")
 
-# --- Audio Utilities ---
 def ulaw_to_pcm(ulaw_bytes: bytes) -> bytes:
     return audioop.ulaw2lin(ulaw_bytes, 2)
 
@@ -96,11 +103,7 @@ def calculate_rms(chunk: bytes) -> float:
 
 async def _send_dummy_frame(stream_sid: str):
     dummy_frame = base64.b64encode(b"\xff" * 160).decode()
-    await websocket.send_json({
-        "event": "media",
-        "streamSid": stream_sid,
-        "media": {"payload": dummy_frame}
-    })
+    await websocket.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": dummy_frame}})
     logger.info("🟡 Sent dummy frame to hold stream open.")
 
 async def _send_clear(stream_sid: str):
@@ -111,17 +114,16 @@ async def _send_clear(stream_sid: str):
         logger.error(f"Failed sending clear: {e}")
 
 async def _stream_mp3_path(stream_sid: str, mp3_path: str):
-    """Blocking send inside media_stream coroutine. Reads MP3, encodes to μ-law 8kHz, streams at 20ms pace."""
+    """Reads MP3, encodes to μ-law 8kHz, streams at 20ms pace (fallback path)."""
     frames = encode_mp3_to_ulaw_frames(mp3_path)
     logger.info(f"📢 Streaming {os.path.basename(mp3_path)}: {len(frames)} frames")
     await _stream_ulaw_frames(stream_sid, frames)
     logger.info(f"✅ Finished streaming {os.path.basename(mp3_path)}")
 
-# --- WebSocket Route ---
 @app.websocket("/stream")
 async def media_stream():
     logger.info("WebSocket connection established with Twilio.")
-    # Parameters
+    # VAD / chunking parameters
     MIN_SPEECH_RMS_THRESHOLD = 600.0
     CHUNK_SILENCE_DURATION_SECONDS = 0.3
     DONE_SPEAKING_SILENCE_DURATION_SECONDS = 0.6
@@ -129,7 +131,6 @@ async def media_stream():
     MAXCHUNK_DURATION_SECONDS = 10.0
     LEAD_IN_DURATION_SECONDS = 0.2
 
-    # Derived
     FRAME_DURATION_SECONDS = 0.02
     silence_chunk_limit = int(CHUNK_SILENCE_DURATION_SECONDS / FRAME_DURATION_SECONDS)
     done_speaking_chunk_limit = int(DONE_SPEAKING_SILENCE_DURATION_SECONDS / FRAME_DURATION_SECONDS)
@@ -161,10 +162,9 @@ async def media_stream():
                 logger.info("Twilio media stream started.")
                 stream_sid = event.get("start", {}).get("streamSid", "placeholder")
 
-                # Prime immediately
                 await _send_dummy_frame(stream_sid)
 
-                # Play greeting then clear
+                # Optional greeting playback (fallback method)
                 try:
                     greeting_path = "app/audio_static/greeting.mp3"
                     if os.path.exists(greeting_path):
@@ -181,89 +181,94 @@ async def media_stream():
                 break
 
             elif event_type == "media":
-                # Receive caller audio
+                # 1) Handle inbound caller audio (VAD / chunking)
                 payload = event["media"].get("payload")
-                if not payload:
-                    # Still use this opportunity to drain playback queue if any
-                    if stream_sid:
-                        while not llm_playback_queue.empty():
-                            mp3_path = await llm_playback_queue.get()
-                            await _stream_mp3_path(stream_sid, mp3_path)
-                            await _send_clear(stream_sid)
-                    continue
+                if payload:
+                    chunk = base64.b64decode(payload)
+                    rms = calculate_rms(chunk)
+                    pcm = ulaw_to_pcm(chunk)
 
-                chunk = base64.b64decode(payload)
-                rms = calculate_rms(chunk)
-                pcm = ulaw_to_pcm(chunk)
+                    pre_chunk_pcm_buffer.extend(pcm)
 
-                # Always buffer a small lead-in ring to avoid clipping
-                pre_chunk_pcm_buffer.extend(pcm)
-
-                if not in_chunk and rms >= MIN_SPEECH_RMS_THRESHOLD:
-                    if has_spoken and phrase_silence_counter >= done_speaking_chunk_limit:
-                        logger.info("Long silence detected. Generating new phrase ID.")
-                        phrase_id = str(uuid.uuid4())
-                    has_spoken = True
-                    in_chunk = True
-                    silence_counter = 0
-                    phrase_silence_counter = 0
-                    active_pcm.extend(pre_chunk_pcm_buffer)
-                    pre_chunk_pcm_buffer.clear()
-                    logger.info(f"AudioChunk formation initiated in frame #{chunk_index} for phrase_id={phrase_id}")
-
-                if in_chunk:
-                    active_pcm.extend(pcm)
-
-                    if rms < MIN_SPEECH_RMS_THRESHOLD:
-                        silence_counter += 1
-                        phrase_silence_counter += 1
-                    else:
+                    if not in_chunk and rms >= MIN_SPEECH_RMS_THRESHOLD:
+                        if has_spoken and phrase_silence_counter >= done_speaking_chunk_limit:
+                            logger.info("Long silence detected. Generating new phrase ID.")
+                            phrase_id = str(uuid.uuid4())
+                        has_spoken = True
+                        in_chunk = True
                         silence_counter = 0
                         phrase_silence_counter = 0
+                        active_pcm.extend(pre_chunk_pcm_buffer)
+                        pre_chunk_pcm_buffer.clear()
+                        logger.info(f"AudioChunk formation initiated in frame #{chunk_index} for phrase_id={phrase_id}")
 
-                    if silence_counter >= silence_chunk_limit:
-                        if len(active_pcm) >= int(MINCHUNK_DURATION_SECONDS * 8000 * 2):
-                            chunk_obj = AudioChunk(
-                                phrase_id=phrase_id,
-                                chunk_index=chunk_index,
-                                audio_bytes=bytes(active_pcm),
-                                rms=rms,
-                                timestamp=chunk_index * FRAME_DURATION_SECONDS,
-                                duration=len(active_pcm) / (8000 * 2),
-                                transcription="",
-                                capture_state="listening"
-                            )
-                            await ready_chunks.put(chunk_obj)
-                            await transcription_queue.put(chunk_obj)
+                    if in_chunk:
+                        active_pcm.extend(pcm)
 
-                            if phrase_id not in detected_phrases:
-                                detected_phrases[phrase_id] = PhraseObject(phrase_id=phrase_id, chunks=[])
-                            detected_phrases[phrase_id].chunks.append(chunk_obj)
-
-                            logger.info(f"AudioChunk completed at frame #{chunk_index} for phrase_id={phrase_id}")
-                            active_pcm = bytearray()
+                        if rms < MIN_SPEECH_RMS_THRESHOLD:
+                            silence_counter += 1
+                            phrase_silence_counter += 1
+                        else:
                             silence_counter = 0
-                            in_chunk = False
+                            phrase_silence_counter = 0
 
-                elif rms < MIN_SPEECH_RMS_THRESHOLD:
-                    phrase_silence_counter += 1
-                    if phrase_silence_counter == done_speaking_chunk_limit:
-                        if has_spoken:
-                            logger.info("Detected end of phrase based on long silence.")
-                            has_spoken = False
-                            phrase_id = str(uuid.uuid4())
+                        if silence_counter >= silence_chunk_limit:
+                            if len(active_pcm) >= int(MINCHUNK_DURATION_SECONDS * 8000 * 2):
+                                chunk_obj = AudioChunk(
+                                    phrase_id=phrase_id,
+                                    chunk_index=chunk_index,
+                                    audio_bytes=bytes(active_pcm),
+                                    rms=rms,
+                                    timestamp=chunk_index * FRAME_DURATION_SECONDS,
+                                    duration=len(active_pcm) / (8000 * 2),
+                                    transcription="",
+                                    capture_state="listening"
+                                )
+                                await ready_chunks.put(chunk_obj)
+                                await transcription_queue.put(chunk_obj)
 
-                chunk_index += 1
+                                if phrase_id not in detected_phrases:
+                                    detected_phrases[phrase_id] = PhraseObject(phrase_id=phrase_id, chunks=[])
+                                detected_phrases[phrase_id].chunks.append(chunk_obj)
 
-                # Drain any queued assistant audio right after handling this inbound frame
+                                logger.info(f"AudioChunk completed at frame #{chunk_index} for phrase_id={phrase_id}")
+                                active_pcm = bytearray()
+                                silence_counter = 0
+                                in_chunk = False
+
+                    elif rms < MIN_SPEECH_RMS_THRESHOLD:
+                        phrase_silence_counter += 1
+                        if phrase_silence_counter == done_speaking_chunk_limit:
+                            if has_spoken:
+                                logger.info("Detected end of phrase based on long silence.")
+                                has_spoken = False
+                                phrase_id = str(uuid.uuid4())
+
+                    chunk_index += 1
+
+                # 2) Drain any queued assistant audio immediately after each inbound frame
                 if stream_sid:
+                    # Streaming path (B): send text requests as real-time μ-law frames
+                    while ELEVEN_STREAMING and not tts_requests_queue.empty():
+                        text = await tts_requests_queue.get()
+                        logger.info("🔊 Streaming TTS (live) for %d chars", len(text))
+                        await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
+                        await _send_clear(stream_sid)
+
+                    # Fallback/file path: still supported
                     while not llm_playback_queue.empty():
                         mp3_path = await llm_playback_queue.get()
                         await _stream_mp3_path(stream_sid, mp3_path)
                         await _send_clear(stream_sid)
 
-            # Other Twilio events are ignored, but we still opportunistically drain queue
+            # Also opportunistically drain outside of media events
             if stream_sid:
+                while ELEVEN_STREAMING and not tts_requests_queue.empty():
+                    text = await tts_requests_queue.get()
+                    logger.info("🔊 Streaming TTS (live) for %d chars", len(text))
+                    await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
+                    await _send_clear(stream_sid)
+
                 while not llm_playback_queue.empty():
                     mp3_path = await llm_playback_queue.get()
                     await _stream_mp3_path(stream_sid, mp3_path)
@@ -273,5 +278,4 @@ async def media_stream():
         logger.error(f"WebSocket error: {e}")
 
     finally:
-        # make sure the main loop cam exit even if Twilio never sent stop
         call_ended.set()

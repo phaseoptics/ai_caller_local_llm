@@ -18,9 +18,9 @@ from app.conversation_manager import handle_phrase
 USE_LOCAL_WHISPER = True
 
 # Local model defaults aimed at better accuracy on CPU (still reasonable latency)
-LOCAL_MODEL_NAME = "small.en"          # try "medium.en" if you need even more accuracy (slower)
+LOCAL_MODEL_NAME = "small.en"          # try "medium.en" for more accuracy (slower)
 LOCAL_COMPUTE_TYPE = "int8_float32"    # higher fidelity than int8; faster than full float32
-LOCAL_BEAM_SIZE = 5                    # beam search for accuracy; raise/lower to trade accuracy/latency
+LOCAL_BEAM_SIZE = 5                    # beam search for accuracy
 FORCE_LANGUAGE = "en"                  # skip detection for speed/stability
 DOWNLOAD_ROOT = "/mnt/data/models/faster-whisper"
 
@@ -38,15 +38,9 @@ oai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # --- faster-whisper globals (lazy init) ---
 _faster_model = None
 
-# --------------------------------------------------------------------------------------
-# Utility: 8 kHz PCM16 (bytes) -> 16 kHz float32 numpy array in [-1, 1]
-# Simple 2x linear upsample (fast, adequate for telephony)
-# --------------------------------------------------------------------------------------
 def pcm8k_bytes_to_float32_16k(audio_bytes: bytes) -> Tuple[np.ndarray, Dict[str, float]]:
     t0 = time.perf_counter()
     pcm16 = np.frombuffer(audio_bytes, dtype=np.int16)
-
-    # Normalize to float32 [-1, 1]
     x = pcm16.astype(np.float32) / 32768.0
 
     if x.size == 0:
@@ -54,7 +48,6 @@ def pcm8k_bytes_to_float32_16k(audio_bytes: bytes) -> Tuple[np.ndarray, Dict[str
     else:
         up = np.empty(x.size * 2, dtype=np.float32)
         up[0::2] = x
-        # Midpoints between samples (last sample repeats)
         if x.size > 1:
             up[1:-1:2] = (x[:-1] + x[1:]) * 0.5
             up[-1] = x[-1]
@@ -64,9 +57,6 @@ def pcm8k_bytes_to_float32_16k(audio_bytes: bytes) -> Tuple[np.ndarray, Dict[str
     t1 = time.perf_counter()
     return up, {"upsample_ms": (t1 - t0) * 1000.0}
 
-# --------------------------------------------------------------------------------------
-# API path (fallback) — in-memory WAV, no disk I/O
-# --------------------------------------------------------------------------------------
 def _pcm_to_wav_bytesio(audio_bytes: bytes, sample_rate: int = 8000) -> io.BytesIO:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav_file:
@@ -107,9 +97,6 @@ async def _transcribe_api(audio_bytes: bytes) -> Tuple[str, Dict]:
     }
     return transcript_text, timings
 
-# --------------------------------------------------------------------------------------
-# faster-whisper local path (higher accuracy settings)
-# --------------------------------------------------------------------------------------
 def _lazy_load_faster_model():
     global _faster_model
     if _faster_model is None:
@@ -125,7 +112,6 @@ def _lazy_load_faster_model():
         logger.info(f"Loaded faster-whisper model='{LOCAL_MODEL_NAME}' device=cpu compute={LOCAL_COMPUTE_TYPE}")
     return _faster_model
 
-# Preload at import to avoid mid-call stall
 if USE_LOCAL_WHISPER:
     _lazy_load_faster_model()
 
@@ -134,23 +120,20 @@ def _transcribe_local_sync(float16k: np.ndarray) -> str:
     segments, info = model.transcribe(
         float16k,
         beam_size=LOCAL_BEAM_SIZE,
-        vad_filter=False,            # VAD already handled upstream
-        language=FORCE_LANGUAGE,     # speed + stability
-        without_timestamps=False,    # keep timestamps for latency analysis
+        vad_filter=False,
+        language=FORCE_LANGUAGE,
+        without_timestamps=False,
     )
     return " ".join(seg.text.strip() for seg in segments if seg.text).strip()
 
 async def _transcribe_local(audio_bytes: bytes, loop: Optional[asyncio.AbstractEventLoop] = None) -> Tuple[str, Dict]:
     t0 = time.perf_counter()
     float16k, up_timing = pcm8k_bytes_to_float32_16k(audio_bytes)
-    t1 = time.perf_counter()
-
     if loop is None:
         loop = asyncio.get_running_loop()
 
     start_model = time.perf_counter()
     try:
-        # Run the sync model in a threadpool to avoid blocking the event loop
         transcript_text = await loop.run_in_executor(None, _transcribe_local_sync, float16k)
     except Exception as e:
         logger.error(f"Transcription (local) failed: {e}")
@@ -166,18 +149,12 @@ async def _transcribe_local(audio_bytes: bytes, loop: Optional[asyncio.AbstractE
     }
     return transcript_text, timings
 
-# --------------------------------------------------------------------------------------
-# Public entry used by the loop
-# --------------------------------------------------------------------------------------
 async def transcribe_audio(audio_bytes: bytes) -> Tuple[str, Dict]:
     if USE_LOCAL_WHISPER:
         return await _transcribe_local(audio_bytes)
     else:
         return await _transcribe_api(audio_bytes)
 
-# --------------------------------------------------------------------------------------
-# Main loop (unchanged logic, enhanced logs)
-# --------------------------------------------------------------------------------------
 async def whisper_transcription_loop():
     logger.info("Whisper transcription loop started.")
     processed_chunks = set()
@@ -186,43 +163,30 @@ async def whisper_transcription_loop():
         try:
             chunk: AudioChunk = await transcription_queue.get()
 
-            # Skip if already handled
             if chunk.transcription != "" or chunk.chunk_index in processed_chunks:
                 continue
 
             # ---- Transcribe this chunk ----
             transcript, timings = await transcribe_audio(chunk.audio_bytes)
 
-            if not transcript:
-                logger.warning(f"Whisper returned empty transcript for chunk {chunk.chunk_index} (phrase {chunk.phrase_id}).")
-
             # Update the shared chunk object
-            chunk.transcription = transcript
+            chunk.transcription = transcript or ""   # empty is allowed
+            chunk.is_transcribed = True              # NEW: mark processed regardless of content
             processed_chunks.add(chunk.chunk_index)
 
             # Timing/latency diagnostics
             if timings.get("path") == "local":
                 logger.info(
                     "WHISPER(local) | phrase=%s chunk=%d dur=%.3fs bytes=%d | upsample=%.1fms whisper=%.1fms total=%.1fms | text='%s'",
-                    chunk.phrase_id,
-                    chunk.chunk_index,
-                    float(chunk.duration),
-                    len(chunk.audio_bytes),
-                    timings.get("upsample_ms", 0.0),
-                    timings.get("whisper_ms", 0.0),
-                    timings.get("total_ms", 0.0),
+                    chunk.phrase_id, chunk.chunk_index, float(chunk.duration), len(chunk.audio_bytes),
+                    timings.get("upsample_ms", 0.0), timings.get("whisper_ms", 0.0), timings.get("total_ms", 0.0),
                     (transcript[:80] + "…") if len(transcript) > 80 else transcript
                 )
             else:
                 logger.info(
                     "WHISPER(api)   | phrase=%s chunk=%d dur=%.3fs bytes=%d | wav=%.1fms whisper=%.1fms total=%.1fms | text='%s'",
-                    chunk.phrase_id,
-                    chunk.chunk_index,
-                    float(chunk.duration),
-                    len(chunk.audio_bytes),
-                    timings.get("wav_build_ms", 0.0),
-                    timings.get("whisper_ms", 0.0),
-                    timings.get("total_ms", 0.0),
+                    chunk.phrase_id, chunk.chunk_index, float(chunk.duration), len(chunk.audio_bytes),
+                    timings.get("wav_build_ms", 0.0), timings.get("whisper_ms", 0.0), timings.get("total_ms", 0.0),
                     (transcript[:80] + "…") if len(transcript) > 80 else transcript
                 )
 
