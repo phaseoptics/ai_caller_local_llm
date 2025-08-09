@@ -112,8 +112,26 @@ async def stream_tts_ulaw_frames(text: str) -> AsyncIterator[str]:
     Yield base64 μ-law frames (160 bytes = 20ms @ 8 kHz) from ElevenLabs in real time.
     """
     loop = asyncio.get_running_loop()
-    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+
+    # Larger burst tolerance; we'll still enforce bounded memory.
+    q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=512)
     SENTINEL = object()
+
+    def _enqueue_bytes_from_thread(data: bytes):
+        """
+        Runs on the event loop thread (scheduled via call_soon_threadsafe).
+        If q is full, drop the oldest item to keep latency low, then enqueue new data.
+        """
+        try:
+            if q.full():
+                try:
+                    _ = q.get_nowait()  # drop oldest to avoid stall
+                except asyncio.QueueEmpty:
+                    pass
+            q.put_nowait(data)
+        except Exception as e:
+            # Swallow any rare race conditions; better to skip a packet than crash.
+            logger.warning(f"⚠️ enqueue warning: {e}")
 
     def _producer():
         try:
@@ -130,7 +148,8 @@ async def stream_tts_ulaw_frames(text: str) -> AsyncIterator[str]:
             )
             for chunk in stream:
                 if chunk:
-                    loop.call_soon_threadsafe(q.put_nowait, chunk)
+                    # hand off to event loop thread safely
+                    loop.call_soon_threadsafe(_enqueue_bytes_from_thread, chunk)
         except Exception as e:
             logger.error(f"❌ ElevenLabs streaming failed: {e}")
         finally:
