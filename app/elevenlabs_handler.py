@@ -134,7 +134,8 @@ async def stream_tts_ulaw_frames(text: str) -> AsyncIterator[str]:
     Head is preserved under pressure (drop-newest policy).
     """
     loop = asyncio.get_running_loop()
-    q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=512)
+    # Queue holds raw bytes frames and a sentinel object to mark end-of-stream
+    q: asyncio.Queue = asyncio.Queue(maxsize=512)  # type: ignore[assignment]
     SENTINEL = object()
 
     def _enqueue_bytes_from_thread(data: bytes):
