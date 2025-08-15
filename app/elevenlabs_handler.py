@@ -91,9 +91,9 @@ def encode_mp3_to_ulaw_frames(mp3_path: str) -> list[str]:
 def generate_static_prompt_mp3s(output_dir: str = "app/audio_static") -> Dict[str, bool]:
     """
     Pre-generate static MP3 prompts used during calls:
-      - greeting.mp3 (existing)
+      - greeting.mp3 ("...Hello, How can I help you today?")
       - reminder.mp3 ("Hello? Are you still there?")
-      - goodbye.mp3 ("Goodbye")
+      - goodbye.mp3 ("Goodbye.")
 
     Returns a dict mapping filename -> bool (synthesis success).
     """
@@ -104,9 +104,9 @@ def generate_static_prompt_mp3s(output_dir: str = "app/audio_static") -> Dict[st
     reminder_path = os.path.join(output_dir, "reminder.mp3")
     goodbye_path = os.path.join(output_dir, "goodbye.mp3")
 
-    greeting_text = "Hellooo! How can I help you today?"
+    greeting_text = "...Hello, How can I help you today?"
     reminder_text = "Hello? Are you still there?"
-    goodbye_text = "Goodbye"
+    goodbye_text = "Goodbye."
 
     logger.info("generate_static_prompt_mp3s: starting generation (model=%s, speed=%s, voice=%s)", ELEVENLABS_MODEL, ELEVENLABS_SPEED, ELEVENLABS_VOICE_ID)
     
