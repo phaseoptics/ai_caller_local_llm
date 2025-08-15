@@ -4,7 +4,7 @@ import threading
 import asyncio
 import base64
 import audioop
-from typing import AsyncIterator, Dict
+from typing import AsyncIterator, Dict, cast
 
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
@@ -43,10 +43,14 @@ except ValueError:
 
 client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
+if not ELEVENLABS_VOICE_ID:
+    logger.info("ELEVENLABS_VOICE_ID not set — ElevenLabs will use its default voice.")
+
 def synthesize_speech_to_mp3(text: str, output_path: str) -> bool:
     try:
+        voice_id = cast(str, ELEVENLABS_VOICE_ID)
         audio_stream = client.text_to_speech.convert(
-            voice_id=ELEVENLABS_VOICE_ID,
+            voice_id=voice_id,
             model_id=ELEVENLABS_MODEL,
             text=text,
             output_format="mp3_44100_128",
@@ -145,8 +149,9 @@ async def stream_tts_ulaw_frames(text: str) -> AsyncIterator[str]:
 
     def _producer():
         try:
+            voice_id = cast(str, ELEVENLABS_VOICE_ID)
             stream = client.text_to_speech.convert(
-                voice_id=ELEVENLABS_VOICE_ID,
+                voice_id=voice_id,
                 model_id=ELEVENLABS_MODEL,
                 text=text,
                 output_format="ulaw_8000",
