@@ -4,7 +4,7 @@ import threading
 import asyncio
 import base64
 import audioop
-from typing import AsyncIterator
+from typing import AsyncIterator, Dict
 
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
@@ -13,6 +13,22 @@ from pydub import AudioSegment, effects
 
 logger = logging.getLogger("elevenlabs_handler")
 logger.setLevel(logging.INFO)
+# Prevent messages from also being handled by the root logger (avoids duplicate output)
+logger.propagate = False
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+else:
+    # Ensure any pre-existing handlers will also emit INFO and have a formatter
+    for h in logger.handlers:
+        h.setLevel(logging.INFO)
+        if h.formatter is None:
+            h.setFormatter(formatter)
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("elevenlabs").setLevel(logging.WARNING)
 
@@ -72,10 +88,41 @@ def encode_mp3_to_ulaw_frames(mp3_path: str) -> list[str]:
     frame_size = 160
     return [base64.b64encode(mulaw[i:i+frame_size]).decode("utf-8") for i in range(0, len(mulaw), frame_size)]
 
-def generate_initial_greeting_mp3(output_path: str = "app/audio_static/greeting.mp3") -> bool:
-    greeting_text = "Hello. How can I help you today?"
-    logger.info(f"🎙️ Generating initial greeting MP3 (model={ELEVENLABS_MODEL}, speed={ELEVENLABS_SPEED}): {greeting_text}")
-    return synthesize_speech_to_mp3(greeting_text, output_path)
+def generate_static_prompt_mp3s(output_dir: str = "app/audio_static") -> Dict[str, bool]:
+    """
+    Pre-generate static MP3 prompts used during calls:
+      - greeting.mp3 (existing)
+      - reminder.mp3 ("Hello? Are you still there?")
+      - goodbye.mp3 ("Goodbye")
+
+    Returns a dict mapping filename -> bool (synthesis success).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    results: Dict[str, bool] = {}
+
+    greeting_path = os.path.join(output_dir, "greeting.mp3")
+    reminder_path = os.path.join(output_dir, "reminder.mp3")
+    goodbye_path = os.path.join(output_dir, "goodbye.mp3")
+
+    greeting_text = "Hellooo! How can I help you today?"
+    reminder_text = "Hello? Are you still there?"
+    goodbye_text = "Goodbye"
+
+    logger.info("generate_static_prompt_mp3s: starting generation (model=%s, speed=%s, voice=%s)", ELEVENLABS_MODEL, ELEVENLABS_SPEED, ELEVENLABS_VOICE_ID)
+    
+    results[os.path.basename(greeting_path)] = synthesize_speech_to_mp3(
+        greeting_text, greeting_path
+    )
+
+    results[os.path.basename(reminder_path)] = synthesize_speech_to_mp3(
+        reminder_text, reminder_path
+    )
+
+    results[os.path.basename(goodbye_path)] = synthesize_speech_to_mp3(
+        goodbye_text, goodbye_path
+    )
+
+    return results
 
 async def stream_tts_ulaw_frames(text: str) -> AsyncIterator[str]:
     """

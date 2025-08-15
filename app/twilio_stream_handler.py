@@ -15,6 +15,7 @@ import uuid
 from app.conversation_manager import handle_phrase
 from app.data_types import AudioChunk, PhraseObject
 from app.queues import llm_playback_queue, tts_requests_queue
+from app.queues import start_assistant_playing, stop_assistant_playing, reset_playback_pause_accumulator
 from app.elevenlabs_handler import encode_mp3_to_ulaw_frames, stream_tts_ulaw_frames
 
 # Global Variables and Events
@@ -33,6 +34,11 @@ def get_last_speech_time() -> float:
 def _mark_speech_now():
     global _last_speech_time
     _last_speech_time = time.monotonic()
+    # Reset playback pause accumulator whenever caller speaks
+    try:
+        reset_playback_pause_accumulator()
+    except Exception:
+        pass
 
 # Load environment variables
 load_dotenv()
@@ -162,6 +168,14 @@ async def media_stream():
 
     try:
         while True:
+            # If main signals shutdown, close this websocket so Twilio sees the stream stop
+            if call_ended.is_set():
+                logger.info("Call end signaled by main; closing Twilio websocket.")
+                try:
+                    await websocket.close(code=1000)
+                except Exception:
+                    pass
+                break
             msg = await websocket.receive()
             if msg is None:
                 logger.warning("WebSocket closed by Twilio.")
@@ -271,27 +285,61 @@ async def media_stream():
                     while ELEVEN_STREAMING and not tts_requests_queue.empty():
                         text = await tts_requests_queue.get()
                         logger.info("🔊 Streaming TTS (live) for %d chars", len(text))
+                        # Pause silence timer while assistant is streaming
+                        try:
+                            start_assistant_playing()
+                        except Exception:
+                            pass
                         await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
                         await _send_clear(stream_sid)
+                        try:
+                            stop_assistant_playing()
+                        except Exception:
+                            pass
 
                     # Fallback/file path: still supported
                     while not llm_playback_queue.empty():
                         mp3_path = await llm_playback_queue.get()
+                        # Pause silence timer while assistant is playing file-based fallback audio
+                        try:
+                            start_assistant_playing()
+                        except Exception:
+                            pass
                         await _stream_mp3_path(stream_sid, mp3_path)
                         await _send_clear(stream_sid)
+                        try:
+                            stop_assistant_playing()
+                        except Exception:
+                            pass
 
             # Also opportunistically drain outside of media events
             if stream_sid:
                 while ELEVEN_STREAMING and not tts_requests_queue.empty():
                     text = await tts_requests_queue.get()
                     logger.info("🔊 Streaming TTS (live) for %d chars", len(text))
+                    try:
+                        start_assistant_playing()
+                    except Exception:
+                        pass
                     await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
                     await _send_clear(stream_sid)
+                    try:
+                        stop_assistant_playing()
+                    except Exception:
+                        pass
 
                 while not llm_playback_queue.empty():
                     mp3_path = await llm_playback_queue.get()
+                    try:
+                        start_assistant_playing()
+                    except Exception:
+                        pass
                     await _stream_mp3_path(stream_sid, mp3_path)
                     await _send_clear(stream_sid)
+                    try:
+                        stop_assistant_playing()
+                    except Exception:
+                        pass
 
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
