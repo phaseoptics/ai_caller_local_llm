@@ -34,6 +34,7 @@ def get_last_speech_time() -> float:
 def _mark_speech_now():
     global _last_speech_time
     _last_speech_time = time.monotonic()
+    logger.info("_mark_speech_now: updated last_speech_time=%f", _last_speech_time)
     # Reset playback pause accumulator whenever caller speaks
     try:
         reset_playback_pause_accumulator()
@@ -43,6 +44,10 @@ def _mark_speech_now():
 # Load environment variables
 load_dotenv()
 ELEVEN_STREAMING = os.getenv("ELEVEN_STREAMING", "false").lower() == "true"
+try:
+    PLAYBACK_CLEAR_MARGIN = float(os.getenv("PLAYBACK_CLEAR_MARGIN", "0.25"))
+except Exception:
+    PLAYBACK_CLEAR_MARGIN = 0.25
 
 # Configure logging
 logger = logging.getLogger("twilio_handler")
@@ -142,7 +147,10 @@ async def _stream_mp3_path(stream_sid: str, mp3_path: str):
 async def media_stream():
     logger.info("WebSocket connection established with Twilio.")
     # VAD / chunking parameters
-    MIN_SPEECH_RMS_THRESHOLD = 750.0
+    try:
+        MIN_SPEECH_RMS_THRESHOLD = float(os.getenv("TWILIO_MIN_SPEECH_RMS_THRESHOLD", "750"))
+    except Exception:
+        MIN_SPEECH_RMS_THRESHOLD = 750.0
     CHUNK_SILENCE_DURATION_SECONDS = 0.3
     DONE_SPEAKING_SILENCE_DURATION_SECONDS = 0.5
     MINCHUNK_DURATION_SECONDS = 0.5
@@ -165,6 +173,7 @@ async def media_stream():
     in_chunk = False
     has_spoken = False
     stream_sid = None
+    first_media_logged = False
 
     try:
         while True:
@@ -198,6 +207,12 @@ async def media_stream():
                     greeting_path = "app/audio_static/greeting.mp3"
                     if os.path.exists(greeting_path):
                         await _stream_mp3_path(stream_sid, greeting_path)
+                        # Reset last-speech timestamp after greeting so the watchdog
+                        # does not count the greeting playback as caller silence.
+                        try:
+                            _mark_speech_now()
+                        except Exception:
+                            pass
                         await _send_clear(stream_sid)
                     else:
                         logger.warning("No greeting.mp3 found, skipping greeting playback.")
@@ -216,6 +231,17 @@ async def media_stream():
                     chunk = base64.b64decode(payload)
                     rms = calculate_rms(chunk)
                     pcm = ulaw_to_pcm(chunk)
+
+                    # Log first inbound media RMS to aid debugging of missed first-speech
+                    if not first_media_logged:
+                        logger.info("First media frame RMS=%.1f (threshold=%.1f)", rms, MIN_SPEECH_RMS_THRESHOLD)
+                        # Ensure the silence timer registers this inbound media so the
+                        # watchdog doesn't prematurely think the caller is silent.
+                        try:
+                            _mark_speech_now()
+                        except Exception:
+                            pass
+                        first_media_logged = True
 
                     # Update "last speech" whenever the caller is above the threshold.
                     if rms >= MIN_SPEECH_RMS_THRESHOLD:
@@ -291,6 +317,9 @@ async def media_stream():
                         except Exception:
                             pass
                         await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
+                        # Small margin to ensure the final audio frames arrive at Twilio
+                        # before sending clear; prevents clipped last syllable.
+                        await asyncio.sleep(PLAYBACK_CLEAR_MARGIN)
                         await _send_clear(stream_sid)
                         try:
                             stop_assistant_playing()
@@ -306,6 +335,7 @@ async def media_stream():
                         except Exception:
                             pass
                         await _stream_mp3_path(stream_sid, mp3_path)
+                        await asyncio.sleep(PLAYBACK_CLEAR_MARGIN)
                         await _send_clear(stream_sid)
                         try:
                             stop_assistant_playing()
@@ -322,6 +352,7 @@ async def media_stream():
                     except Exception:
                         pass
                     await _stream_ulaw_frame_iter(stream_sid, stream_tts_ulaw_frames(text))
+                    await asyncio.sleep(PLAYBACK_CLEAR_MARGIN)
                     await _send_clear(stream_sid)
                     try:
                         stop_assistant_playing()
@@ -335,6 +366,7 @@ async def media_stream():
                     except Exception:
                         pass
                     await _stream_mp3_path(stream_sid, mp3_path)
+                    await asyncio.sleep(PLAYBACK_CLEAR_MARGIN)
                     await _send_clear(stream_sid)
                     try:
                         stop_assistant_playing()
