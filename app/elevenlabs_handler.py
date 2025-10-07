@@ -108,7 +108,7 @@ def generate_static_prompt_mp3s(output_dir: str = "app/audio_static") -> Dict[st
     reminder_path = os.path.join(output_dir, "reminder.mp3")
     goodbye_path = os.path.join(output_dir, "goodbye.mp3")
 
-    greeting_text = "...Hello, How can I help you today?"
+    greeting_text = ".Hello, you've reached Cody's AI Assistant. How can I help you today?"
     reminder_text = "Hello? Are you still there?"
     goodbye_text = "Goodbye."
 
