@@ -28,17 +28,17 @@ Memory and conversational persistence are provided by **Open WebUI**, which conn
 
 Once your dependencies are installed and your `.env` file is configured with valid API keys, running the AI Caller is straightforward.
 
-1. **Activate your environment**  
-   If you’re using your virtual environment named `grok`, activate it first:
+1. **Start ngrok**
 
+   Open a terminal and run:
    ```bash
-   source grok/bin/activate
+   ngrok http --domain=<your-ngrok-domain> 5000
    ```
-   *(On Windows PowerShell, use `.\grok\Scripts\Activate.ps1`.)*
+   This exposes your local server to the public Internet at an HTTPS address, which Twilio will use to reach it.
 
 2. **Start the application**
 
-   From the project root directory:
+   In another terminal, navigate to the project directory and run:
    ```bash
    python main.py
    ```
@@ -47,9 +47,9 @@ Once your dependencies are installed and your `.env` file is configured with val
 
    In your Twilio console, configure your phone number so that:
    - **A Call Comes In** → points to  
-     `https://your-domain/voice`
+     `https://<your-ngrok-domain>/voice`
    - **WebSocket Stream** → connects to  
-     `wss://your-domain/ai_caller/stream`
+     `wss://<your-ngrok-domain>/ai_caller/stream`
 
 4. **Make a call**
 
@@ -59,7 +59,8 @@ Once your dependencies are installed and your `.env` file is configured with val
    - Generate a short, natural response through the local LLM (Gemma via Ollama)  
    - Speak back to you using ElevenLabs, streamed in real time  
 
-The system continues running until you stop it. All voice detection, transcription, reasoning, and playback occur locally on your server, maintaining privacy and low latency.
+The system continues running until you stop it.  
+All voice detection, transcription, reasoning, and playback occur locally on your server, maintaining privacy and low latency.
 
 ---
 
