@@ -22,6 +22,44 @@ Because it runs locally, all inference and streaming happen directly on that har
 
 Memory and conversational persistence are provided by **Open WebUI**, which connects to Ollama on the same server and manages context across turns. More powerful servers could easily run larger models for richer, more nuanced conversations, but this configuration demonstrates that a small, energy-efficient home system is already capable of sustaining a smooth, fully private AI calling experience.
 
+---
+
+## How to Use
+
+Once your dependencies are installed and your `.env` file is configured with valid API keys, running the AI Caller is straightforward.
+
+1. **Activate your environment**  
+   If you’re using your virtual environment named `grok`, activate it first:
+
+   ```bash
+   source grok/bin/activate
+   ```
+   *(On Windows PowerShell, use `.\grok\Scripts\Activate.ps1`.)*
+
+2. **Start the application**
+
+   From the project root directory:
+   ```bash
+   python main.py
+   ```
+
+3. **Connect Twilio**
+
+   In your Twilio console, configure your phone number so that:
+   - **A Call Comes In** → points to  
+     `https://your-domain/voice`
+   - **WebSocket Stream** → connects to  
+     `wss://your-domain/ai_caller/stream`
+
+4. **Make a call**
+
+   Dial your Twilio number. The AI Caller will:
+   - Answer automatically  
+   - Listen and transcribe your speech with Whisper  
+   - Generate a short, natural response through the local LLM (Gemma via Ollama)  
+   - Speak back to you using ElevenLabs, streamed in real time  
+
+The system continues running until you stop it. All voice detection, transcription, reasoning, and playback occur locally on your server, maintaining privacy and low latency.
 
 ---
 
