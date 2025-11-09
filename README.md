@@ -17,6 +17,35 @@ It is not about replacing people. It is about **amplifying human presence** when
 
 ## Overview of Operation
 
+---
+
+## External Accounts and Services
+
+This project connects several external services, each serving a specific role in the call flow.
+
+**Twilio**  
+Handles all phone connectivity. It receives the incoming call, opens a secure WebSocket to your server, and streams μ-law 8 kHz audio frames in both directions. Without Twilio, there is no telephony interface.
+
+**ElevenLabs**  
+Provides the voice of the AI caller. Text responses from the local LLM are sent to ElevenLabs for conversion into lifelike speech, which is then streamed back to the caller in real time. It supports both streaming and MP3 synthesis modes.
+
+**Ollama (Local LLM)**  
+Runs the conversational model locally on your own hardware. By default, the system uses Gemma 3:1B through Ollama for privacy, low latency, and offline operation. The LLM receives the transcribed text and returns a short, natural reply.
+
+**Whisper (Speech to Text)**  
+Transcribes each spoken phrase into text. It can run either locally using Faster-Whisper or remotely through the OpenAI Whisper API, depending on your environment settings.
+
+**ngrok or Caddy**  
+Used to expose your local server securely to the public Internet so that Twilio can reach it. Twilio requires all endpoints to be HTTPS with valid TLS certificates. Either ngrok or a self-hosted reverse proxy (like Caddy) can fulfill this role.
+
+**GitHub**  
+Hosts the public repository and serves as the contact point for commercial licensing or collaboration. Commercial inquiries can be opened as Issues on the repository page.
+
+Together, these services create a full real-time voice loop:
+
+Caller → Twilio → WebSocket → Quart Server → Whisper → Local LLM → ElevenLabs → Twilio → Caller
+
+
 1. **Incoming call via Twilio**  
    Twilio routes the call to the `/voice` webhook.  
    Twilio then opens a **WebSocket** to `/ai_caller/stream` that sends μ-law 8 kHz 20 ms audio frames and receives playback frames in real time.
