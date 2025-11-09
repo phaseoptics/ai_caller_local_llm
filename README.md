@@ -1,108 +1,90 @@
 # AI Caller Local LLM
 
-A real time AI Caller Assistant for home servers. It answers calls through Twilio Media Streams, transcribes speech with Whisper, reasons with a local LLM through Ollama, and speaks back with ElevenLabs. Designed for low latency, privacy, and full control of the conversation loop.
+This project implements a real time **AI Caller Assistant** that answers incoming phone calls using a **local LLM** for conversation, **Whisper** for speech to text, and **ElevenLabs** for speech playback.  
+It is designed to run on a home server with low latency and complete control over the audio and conversation flow.
 
 ---
 
 ## Purpose
 
-This project began as a personal effort.  
-My mother has dementia, and I wanted to create an AI caller that would reach out with infinite patience and kindness, check in, offer reminders, and provide simple companionship when family could not be there.  
+This project began as a deeply personal effort.  
+My mother has dementia, and I wanted to create an AI caller that could reach out to her with **infinite patience and kindness** — a gentle, dependable companion able to check in, offer reminders, or simply keep her company when family members could not be there.
 
-The goal is to show that careful, local, privacy respecting AI can extend compassion through technology. It is not about replacing people. It is about amplifying human presence when loved ones cannot always be on the line.
+The goal of the **Youngbull AI Caller** is to demonstrate that artificial intelligence, when used locally and designed carefully, can extend compassion through technology.  
+It is not about replacing people. It is about **amplifying human presence** when loved ones cannot always be on the line.
 
 ---
 
 ## Overview of Operation
 
-1. **Incoming call through Twilio**
-   * Twilio hits the `/voice` webhook.
-   * Twilio then opens a secure WebSocket to `/ai_caller/stream` and sends μ law 8 kHz 20 ms frames as base64.
+1. **Incoming call via Twilio**  
+   Twilio routes the call to the `/voice` webhook.  
+   Twilio then opens a **WebSocket** to `/ai_caller/stream` that sends μ-law 8 kHz 20 ms audio frames and receives playback frames in real time.
 
-2. **Voice Activity Detection**
-   * Caller audio is assembled into higher level speech units called AudioChunks and Phrases (defined below), not just raw Twilio frames.
-   * Completed phrases are sent to Whisper for transcription.
+2. **Voice Activity Detection (VAD)**  
+   Incoming frames are decoded, their RMS loudness is measured, and they are assembled into higher level speech units (`AudioChunk`s and `PhraseObject`s).
 
-3. **Transcription**
-   * Whisper runs locally through faster whisper or remotely through OpenAI Whisper, based on configuration.
+3. **Transcription**  
+   When a phrase is complete, its audio is sent to **Whisper** (local Faster-Whisper or OpenAI Whisper API) for transcription.
 
-4. **Local LLM response**
-   * Transcripts are sent to a local LLM through Ollama. The default model is Gemma 3:1B with concise, natural guardrails.
+4. **LLM Response**  
+   The transcribed text is passed to the **local LLM** through **Ollama** (default: Gemma 3:1B).  
+   Guardrails ensure short, natural, ≤ 3-sentence replies.
 
-5. **Speech back to the caller**
-   * ElevenLabs turns the LLM text into μ law 8 kHz frames for immediate playback over the same WebSocket, or falls back to MP3 files that are converted to frames.
+5. **Speech Playback**  
+   The LLM response is converted into μ-law 8 kHz frames by **ElevenLabs** (streaming or MP3 fallback) and sent back through the same WebSocket for immediate playback.
 
-6. **Silence watchdog**
-   * If the caller stays silent beyond a timeout, the call ends cleanly.
+6. **Silence Watchdog**  
+   If the caller is silent longer than `MAX_SILENCE_SECONDS`, the call ends automatically.
 
 ---
 
-## Voice Activity Detection design
+## Voice Activity Detection (VAD) Design
 
-This project uses custom speech units that are distinct from Twilio’s transport frames.
+This project defines its own VAD logic rather than using Twilio’s 20 ms frames as speech units.
 
 **AudioChunk**  
 * A contiguous segment of decoded PCM16 audio at 8 kHz that represents detected speech.  
-* Created when RMS exceeds `MIN_SPEECH_RMS_THRESHOLD`. Grows while speech continues, splits on short silences, and is bounded by min and max chunk duration settings.  
-* Stores metadata: `phrase_id`, `chunk_index`, `rms`, `timestamp`, `duration`, `capture_state`.  
-* Whisper writes the transcript back into the same object, setting `transcription` and `is_transcribed=True` even if the text is empty.
+* Created when the RMS level exceeds `MIN_SPEECH_RMS_THRESHOLD`.  
+* Continues to grow until a brief silence exceeds `CHUNK_SILENCE_DURATION_SECONDS` or its maximum duration is reached.  
+* Each chunk stores:  
+  `phrase_id`, `chunk_index`, `rms`, `timestamp`, `duration`, `capture_state`, and later the `transcription`.  
+* After Whisper finishes, the chunk is marked `is_transcribed=True` even if empty, ensuring phrase completion logic stays deterministic.
 
 **PhraseObject**  
-* An ordered list of AudioChunks that together form one coherent spoken phrase.  
-* When a longer silence reaches `DONE_SPEAKING_SILENCE_DURATION_SECONDS`, the phrase is closed.  
-* The phrase text is the concatenation of all non empty chunk transcripts, then it is sent to the LLM.  
-* A phrase is considered complete when every chunk has been processed by Whisper, not only when text is non empty.
+* A list of related `AudioChunk`s forming a single coherent spoken phrase.  
+* When silence exceeds `DONE_SPEAKING_SILENCE_DURATION_SECONDS`, the phrase closes.  
+* The system concatenates non-empty chunk transcripts and sends the phrase to the LLM.  
+* A phrase is considered complete when **all** its chunks are transcribed.
 
-**Why this matters**  
-* Natural segmentation for human like turn taking.  
-* Lower latency than full file boundaries.  
-* Clear async coordination through queues so that the WebSocket is only written from the handler coroutine.
+**Silence handling**  
+* If total silence exceeds `MAX_SILENCE_SECONDS`, the system ends the call.  
 
----
-
-## Repository structure
-
-The following files reflect the working modules you uploaded.
-
-* `app/data_types.py`  
-  Defines `AudioChunk` and `PhraseObject`. Each chunk includes raw audio bytes, timing, RMS, capture state, and holds its own Whisper result through the `transcription` field. `PhraseObject.is_complete()` returns true when all chunks have been processed by Whisper.
-
-* `app/queues.py`  
-  Central asyncio queues.  
-  `llm_playback_queue` carries MP3 file paths for fallback playback.  
-  `tts_requests_queue` carries plain text for true streaming TTS back to the handler.
-
-* `app/whisper_handler.py`  
-  Transcription pipeline. Can run faster whisper locally or call the OpenAI Whisper API.  
-  Includes 8 kHz PCM to 16 kHz float upsampling for local models.  
-  Runs a background `whisper_transcription_loop()` that reads chunks from the transcription queue, transcribes them in place, and triggers phrase handling once all chunks are processed.
-
-* `app/llm_local_handler.py`  
-  Minimal, focused chat call to local Ollama.  
-  Defaults: `MODEL_NAME="gemma3:1b"`, concise replies, no lists, natural tone.  
-  Returns the assistant reply and updated history for stateful conversation.
-
-* `app/elevenlabs_handler.py`  
-  Two paths.  
-  True streaming: yields μ law 8 kHz base64 frames directly in an async iterator.  
-  Fallback: synth to MP3, normalize and compress, then convert to μ law frames for smooth 20 ms pacing.  
-  Includes an optional greeting generator.
-
-* `app/conversation_manager.py`  
-  Holds the per call message history.  
-  On phrase completion, calls the local LLM, logs timing, and either enqueues text for streaming TTS or writes an MP3 for fallback playback.
-
-> Note  
-> Your WebSocket stream handler and the main app entry point are not shown above. In this design, the WebSocket coroutine is responsible for receiving Twilio frames, doing VAD assembly, and sending audio back, while all blocking work is offloaded via queues or executors. The WebSocket object is never shared across tasks.
+This structure produces natural turn-taking and low latency while preventing the WebSocket from being accessed outside its coroutine.
 
 ---
 
-## Environment variables
+## Repository Structure
 
-Copy and adapt as `.env` in the repo root.
+| File | Description |
+|------|--------------|
+| `app/main.py` | Entry point. Starts the Quart + Hypercorn ASGI server, initializes queues, and supervises the main event loop. |
+| `app/twilio_stream_handler.py` | WebSocket endpoint for Twilio Media Streams. Handles frame decoding, RMS measurement, VAD segmentation, and outbound μ-law frame playback. All writing to the socket happens within this coroutine. |
+| `app/data_types.py` | Defines `AudioChunk` and `PhraseObject`. Each chunk stores raw audio bytes, metadata, and its Whisper transcription. Phrases group chunks and determine when a caller has finished speaking. |
+| `app/whisper_handler.py` | Handles transcription via local Faster-Whisper or OpenAI Whisper. Converts 8 kHz PCM to 16 kHz float arrays, runs the model, and updates the corresponding `AudioChunk`. |
+| `app/llm_local_handler.py` | Communicates with the local Ollama API. Enforces guardrails on responses (≤ 3 sentences, no lists). Returns concise replies for smooth conversational pacing. |
+| `app/elevenlabs_handler.py` | Handles text-to-speech through ElevenLabs. Supports streaming μ-law frames or file-based MP3 synthesis. Manages pacing and playback formatting. |
+| `app/conversation_manager.py` | Maintains conversation history, coordinates between the Whisper transcription loop and LLM response generation, and manages playback queues. |
+| `app/queues.py` | Central asynchronous queues connecting modules (`transcription_queue`, `tts_requests_queue`, and `llm_playback_queue`). |
+
+---
+
+## Environment Variables
+
+Create a `.env` file in the repository root:
 
 ```env
-# Core
+# General
 MAX_SILENCE_SECONDS=30
 STORE_ALL_RESPONSE_AUDIO=false
 
@@ -110,13 +92,13 @@ STORE_ALL_RESPONSE_AUDIO=false
 OLLAMA_URL=http://localhost:11434/api/chat
 MODEL_NAME=gemma3:1b
 MAX_TOKENS=120
-TEMPERATURE=0.7
+TEMPERATURE=0.6
 
 # ElevenLabs
 ELEVENLABS_API_KEY=your_api_key
 ELEVENLABS_VOICE_ID=your_voice_id
 ELEVENLABS_MODEL=eleven_flash_v2_5
-ELEVENLABS_SPEED=0.90
+ELEVENLABS_SPEED=0.9
 ELEVEN_STREAMING=true
 
 # Whisper
@@ -126,3 +108,75 @@ LOCAL_COMPUTE_TYPE=int8_float32
 LOCAL_BEAM_SIZE=5
 FORCE_LANGUAGE=en
 OPENAI_API_KEY=your_openai_key_if_needed
+```
+
+---
+
+## Deployment Overview
+
+**Endpoints required by Twilio**
+
+* HTTPS webhook for Voice: `POST /voice`  
+* Secure WebSocket for Media Streams: `wss://YOUR_DOMAIN/ai_caller/stream`
+
+**Typical flow**
+
+1. Twilio calls `https://YOUR_DOMAIN/voice`.  
+2. The `/voice` route returns TwiML instructing Twilio to open the WebSocket to `/ai_caller/stream`.  
+3. Twilio streams 20 ms μ-law frames in both directions for live conversation.
+
+---
+
+## WebSocket Rules
+
+* Only write to the socket inside the `/stream` coroutine.  
+* Use queues for background tasks that need to send audio.  
+* Stream playback at one 20 ms frame per iteration.  
+* Send `{ "event": "clear" }` after playback to flush Twilio’s audio buffer.
+
+Outbound frame example:
+
+```json
+{
+  "event": "media",
+  "streamSid": "YOUR_STREAM_SID",
+  "media": {
+    "payload": "BASE64_ULAW_160_BYTES"
+  }
+}
+```
+
+Clear command:
+
+```json
+{ "event": "clear", "streamSid": "YOUR_STREAM_SID" }
+```
+
+---
+
+## Running the App
+
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+Expose your server securely (for example with Caddy or ngrok) and point Twilio to your public HTTPS domain.
+
+---
+
+## License
+
+This project is released under the **Youngbull AI Caller License (BY-NC-SA)**.
+
+* ✅ Attribution required: cite “Youngbull AI Caller – https://github.com/phaseoptics/ai_caller_local_llm”.  
+* 🚫 Non-commercial use only: may be used, studied, and modified freely for personal, academic, or research purposes.  
+* 🔄 Share-alike: derivative works must remain open under the same license.  
+* 💼 Commercial use requires a separate license.
+
+See the full terms in the [LICENSE](LICENSE) file.  
+Commercial inquiries should be opened as a GitHub issue:  
+https://github.com/phaseoptics/ai_caller_local_llm/issues  
+
+© 2025 Cody Youngbull
+
