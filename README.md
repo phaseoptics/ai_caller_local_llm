@@ -15,6 +15,16 @@ It is not about replacing people. It is about **amplifying human presence** when
 
 ---
 
+## Tested Deployment
+
+This system is fully tested and operational on my own home server, a Beelink SER8 Pro with 32 GB of DDR5 RAM and a 1 TB SSD.  
+Because it runs locally, all inference and streaming happen directly on that hardware without cloud dependencies. The limited GPU power means I use lightweight language models like **Gemma 3:1B** through **Ollama**, but they perform remarkably well for real-time dialogue and maintain low latency during live calls.  
+
+Memory and conversational persistence are provided by **Open WebUI**, which connects to Ollama on the same server and manages context across turns. More powerful servers could easily run larger models for richer, more nuanced conversations, but this configuration demonstrates that a small, energy-efficient home system is already capable of sustaining a smooth, fully private AI calling experience.
+
+
+---
+
 ## Overview of Operation
 
 ---
