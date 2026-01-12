@@ -13,6 +13,8 @@ except Exception:
     logger = logging.getLogger("llm_local_handler")
     logger.debug("python-dotenv not available; skipping .env load. Make sure env vars are exported if running without .env support.")
 
+from app.config import SYSTEM_INSTRUCTIONS
+
 # Configuration and environment-driven switches
 USE_OPEN_WEBUI = os.getenv("USE_OPEN_WEBUI", "true").lower() != "false"
 OPENWEBUI_BASE_URL = os.getenv("OPENWEBUI_BASE_URL", "http://127.0.0.1:3000")
@@ -40,13 +42,6 @@ logger.setLevel(logging.INFO)
 
 # Track whether we've logged the chosen URL once
 _logged_url: Optional[str] = None
-
-SYSTEM_INSTRUCTIONS = (
-    "You are friendly and speak in a natural, conversational tone. "
-    "Replies must be three sentences or fewer. "
-    "Do not use 'e.g.', lists, bullets, numbering, emoji, slang, or symbols like '*' or '-'. "
-    "Write one short paragraph only."
-)
 
 # Per-turn guardrail is merged into the single system message so the backend
 # always receives a consistent system prompt at messages[0]. This avoids

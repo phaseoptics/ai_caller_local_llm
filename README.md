@@ -8,6 +8,52 @@ It is designed to run on your **home server** with low latency and complete cont
 
 ---
 
+## Operation Commands
+
+Activate the virtual environment in the first terminal.
+
+**Terminal 1**
+```bash
+source venv/bin/activate
+```
+
+Expose the application port using ngrok in a second terminal.
+
+**Terminal 2**
+```bash
+ngrok http 5000 --domain=cody-ai.ngrok.app
+```
+
+Start the Caller Assistant in the first terminal.
+
+**Terminal 1**
+```bash
+python main.py
+```
+
+The Assistant is now running and ready to receive or place calls.
+
+To trigger an outgoing call, activate the virtual environment in a third terminal.
+
+**Terminal 3**
+```bash
+source venv/bin/activate
+```
+
+Trigger the outbound call.
+
+**Terminal 3**
+```bash
+CALL_TRIGGER_TOKEN="$(grep '^CALL_TRIGGER_TOKEN=' .env | cut -d= -f2-)" && \
+curl -i -sS -X POST \
+  -H "Authorization: Bearer ${CALL_TRIGGER_TOKEN}" \
+  https://cody-ai.ngrok.app/call_mom
+```
+
+**Note:** The `.env` file must be present and loaded in any terminal used to run or trigger the Assistant.
+
+---
+
 ## Overview of Operation
 
 1. **Incoming call via Twilio**

@@ -1,3 +1,4 @@
+# app/elevenlabs_handler.py
 import os
 import logging
 import threading
@@ -10,6 +11,8 @@ from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
 from pydub import AudioSegment, effects
+
+from app.config import GREETING_TEXT, REMINDER_TEXT, GOODBYE_TEXT
 
 logger = logging.getLogger("elevenlabs_handler")
 logger.setLevel(logging.INFO)
@@ -108,22 +111,18 @@ def generate_static_prompt_mp3s(output_dir: str = "app/audio_static") -> Dict[st
     reminder_path = os.path.join(output_dir, "reminder.mp3")
     goodbye_path = os.path.join(output_dir, "goodbye.mp3")
 
-    greeting_text = ".Hello, you've reached Cody's AI Assistant. How can I help you today?"
-    reminder_text = "Hello? Are you still there?"
-    goodbye_text = "Goodbye."
-
     logger.info("generate_static_prompt_mp3s: starting generation (model=%s, speed=%s, voice=%s)", ELEVENLABS_MODEL, ELEVENLABS_SPEED, ELEVENLABS_VOICE_ID)
     
     results[os.path.basename(greeting_path)] = synthesize_speech_to_mp3(
-        greeting_text, greeting_path
+        GREETING_TEXT, greeting_path
     )
 
     results[os.path.basename(reminder_path)] = synthesize_speech_to_mp3(
-        reminder_text, reminder_path
+        REMINDER_TEXT, reminder_path
     )
 
     results[os.path.basename(goodbye_path)] = synthesize_speech_to_mp3(
-        goodbye_text, goodbye_path
+        GOODBYE_TEXT, goodbye_path
     )
 
     return results

@@ -1,13 +1,16 @@
+# main.py
 import logging
 import sys
 import asyncio
 import os
 import time
 
-from app.twilio_stream_handler import app, call_ended, ready_chunks, write_all_chunks_to_disk, get_last_speech_time
+from app.twilio_stream_handler import app, call_ended, call_active, ready_chunks, write_all_chunks_to_disk, get_last_speech_time
+from app.transcript_manager import write_transcript
 from app.whisper_handler import whisper_transcription_loop
 from app.elevenlabs_handler import generate_static_prompt_mp3s
 from app.queues import llm_playback_queue, get_playback_pause_since_reset
+from app.config import REMINDER_TEXT, GOODBYE_TEXT
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
@@ -35,16 +38,15 @@ async def run_server():
     Waits for call end OR for the caller to be silent for MAX_SILENCE_SECONDS.
     On exit, cancels tasks and, if enabled, writes buffered audio chunks to disk.
     """
-    # Only persist raw caller chunks if explicitly enabled
     STORE_ALL_RESPONSE_AUDIO = os.getenv("STORE_ALL_RESPONSE_AUDIO", "false").lower() == "true"
 
-    # Max allowed caller silence (seconds)
     try:
         MAX_SILENCE_SECONDS = float(os.getenv("MAX_SILENCE_SECONDS", "30"))
     except ValueError:
         MAX_SILENCE_SECONDS = 60.0
 
-    # Prepare Hypercorn
+    DISABLE_SILENCE_TIMEOUT = MAX_SILENCE_SECONDS <= 0
+
     config = Config()
     config.bind = ["0.0.0.0:5000"]
     config.use_reloader = False
@@ -58,10 +60,8 @@ async def run_server():
 
     logger.info("Waiting for Twilio call to complete or silence timeout...")
 
-    # Watchdog loop: exit if call ends OR caller has been silent for MAX_SILENCE_SECONDS
     try:
-        poll_interval = 0.5  # seconds
-        # Track last reminder effective-silence so we can repeat reminders every REMINDER_SECONDS
+        poll_interval = 0.5
         last_reminder_effective_silence = 0.0
         goodbye_enqueued = False
         REMINDER_SECONDS = 10.0
@@ -73,29 +73,25 @@ async def run_server():
 
             raw_silent_for = time.monotonic() - get_last_speech_time()
             pause = get_playback_pause_since_reset()
-            # Effective silent time excludes time when assistant was playing
             silent_for = max(0.0, raw_silent_for - pause)
 
-            # Reset reminder timer if caller just spoke (raw_silent_for small)
             if raw_silent_for < 0.25:
                 last_reminder_effective_silence = 0.0
 
-            # If caller silent for REMINDER_SECONDS, play a polite reminder (repeatable)
-            if silent_for - last_reminder_effective_silence >= REMINDER_SECONDS:
+            # Reminder: enqueue with transcript text, but do NOT write transcript here.
+            if call_active.is_set() and (silent_for - last_reminder_effective_silence >= REMINDER_SECONDS):
                 reminder_path = "app/audio_static/reminder.mp3"
                 if os.path.exists(reminder_path):
                     logger.info("Silent for %.1fs: enqueueing reminder.", silent_for)
-                    await llm_playback_queue.put(reminder_path)
-                    # record the effective_silence at which we played the reminder
+                    await llm_playback_queue.put({"mp3_path": reminder_path, "text": REMINDER_TEXT})
                     last_reminder_effective_silence = silent_for
 
-            # At MAX_SILENCE_SECONDS, enqueue goodbye once and then trigger clean shutdown (same behavior as before)
-            if not goodbye_enqueued and silent_for >= MAX_SILENCE_SECONDS:
+            # Goodbye: enqueue with transcript text, but do NOT write transcript here.
+            if (not DISABLE_SILENCE_TIMEOUT) and (not goodbye_enqueued) and silent_for >= MAX_SILENCE_SECONDS:
                 goodbye_path = "app/audio_static/goodbye.mp3"
                 if os.path.exists(goodbye_path):
                     logger.info("Silent for %.1fs: enqueueing goodbye and waiting for playback to finish...", silent_for)
-                    await llm_playback_queue.put(goodbye_path)
-                    # Determine goodbye.mp3 duration and wait exactly that long (plus small margin)
+                    await llm_playback_queue.put({"mp3_path": goodbye_path, "text": GOODBYE_TEXT})
                     try:
                         from app.queues import wait_for_playback_completion
                         from pydub import AudioSegment
@@ -114,7 +110,7 @@ async def run_server():
                                 logger.warning("Timed out waiting for goodbye playback; proceeding with shutdown.")
                         except Exception:
                             logger.exception("Fallback wait also failed")
-                # Signal shutdown so the same clean shutdown path runs as when the caller hangs up
+
                 call_ended.set()
                 goodbye_enqueued = True
                 break
@@ -123,7 +119,6 @@ async def run_server():
     except asyncio.CancelledError:
         pass
 
-    # Begin shutdown sequence
     logger.info("Shutting down tasks...")
     server_task.cancel()
     whisper_task.cancel()
@@ -138,25 +133,31 @@ async def run_server():
     except asyncio.CancelledError:
         logger.info("Whisper handler shut down cleanly.")
 
-    # Conditionally persist buffered chunks
     if STORE_ALL_RESPONSE_AUDIO:
         BUFFER_DIR = "app/audio_temp"
         logger.info("Writing %d ready AudioChunks to disk in %s...", ready_chunks.qsize(), BUFFER_DIR)
         await write_all_chunks_to_disk(ready_chunks, BUFFER_DIR)
         logger.info("All chunks written.")
     else:
-        # Drain queue without saving (free memory)
         drained = 0
         while not ready_chunks.empty():
             _ = await ready_chunks.get()
             drained += 1
         logger.info("Skipped writing caller chunks (STORE_ALL_RESPONSE_AUDIO=false). Drained %d buffered chunks.", drained)
 
+    try:
+        ok = write_transcript("app/transcript.txt")
+        if ok:
+            logger.info("Transcript written to app/transcript.txt")
+        else:
+            logger.warning("Transcript write failed")
+    except Exception:
+        logger.exception("Unexpected error while writing transcript")
+
     logger.info("Exiting.")
 
 if __name__ == "__main__":
     try:
-        # Pre-generate greeting/reminder/goodbye synchronously before starting the async server
         try:
             generate_static_prompt_mp3s()
         except Exception:
