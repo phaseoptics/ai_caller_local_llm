@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 app/audio_temp/*
+app/audio_static/*
+app/transcript.txt
